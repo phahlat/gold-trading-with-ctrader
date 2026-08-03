@@ -42,14 +42,14 @@ def test_backtest_volume_uses_fixed_lot_when_backtest_fixed_not_set() -> None:
     assert rule == "gold_fixed_lot_size"
 
 
-def test_backtest_volume_falls_back_to_risk_percent() -> None:
-    settings = SimpleNamespace(backtest_fixed_volume=0.0, fixed_lot_size=0.0, risk_percent=1.0, stop_loss_pips=100.0)
+def test_backtest_volume_falls_back_to_default_minimum_volume() -> None:
+    settings = SimpleNamespace(backtest_fixed_volume=0.0, fixed_lot_size=0.0, stop_loss_pips=100.0)
     service = _service(settings)
 
     volume, rule = service._resolve_backtest_volume(1000.0)
 
-    assert round(volume, 2) == 0.1
-    assert rule == "risk_percent"
+    assert round(volume, 2) == 0.01
+    assert rule == "default_minimum_volume"
 
 
 def test_backtest_volume_normalization_caps_to_profile_max() -> None:

@@ -19,8 +19,13 @@ class GoldRunner:
         self.engine = GoldStrategyEngine(settings.strategy_names)
         self.trade_manager = GoldTradeManager(settings)
 
-    def evaluate_candidates(self, frame: pd.DataFrame, higher_frame: pd.DataFrame | None = None) -> list[Any]:
-        return self.engine.evaluate(frame, self.settings, higher_frame=higher_frame)
+    def evaluate_candidates(
+        self,
+        frame: pd.DataFrame,
+        higher_frame: pd.DataFrame | None = None,
+        strategy_names: list[str] | None = None,
+    ) -> list[Any]:
+        return self.engine.evaluate(frame, self.settings, higher_frame=higher_frame, strategy_names=strategy_names)
 
     def run_once(self, frame: pd.DataFrame, higher_frame: pd.DataFrame | None = None) -> list[dict[str, Any]]:
         candidates = self.evaluate_candidates(frame, higher_frame=higher_frame)

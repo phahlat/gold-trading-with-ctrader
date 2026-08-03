@@ -11,13 +11,18 @@ class GoldTradeManager:
     def __init__(self, settings: GoldSettings) -> None:
         self.settings = settings
 
-    def build_ladder(self, candidate: SignalCandidate) -> list[dict[str, Any]]:
+    def build_ladder(
+        self,
+        candidate: SignalCandidate,
+        stop_loss_pips: float | None = None,
+        take_profit_pips: float | None = None,
+    ) -> list[dict[str, Any]]:
         if not self.settings.enable_multi_entry:
-            return [self._build_trade(candidate, 1)]
+            return [self._build_trade(candidate, 1, stop_loss_pips=stop_loss_pips, take_profit_pips=take_profit_pips)]
 
         entries: list[dict[str, Any]] = []
         for level in range(1, self.settings.ladder_entries + 1):
-            entries.append(self._build_trade(candidate, level))
+            entries.append(self._build_trade(candidate, level, stop_loss_pips=stop_loss_pips, take_profit_pips=take_profit_pips))
         return entries
 
     def update_exit_targets(
@@ -55,15 +60,23 @@ class GoldTradeManager:
 
         return {"stop_loss": round(stop_loss, 5), "take_profit": round(take_profit, 5)}
 
-    def _build_trade(self, candidate: SignalCandidate, level: int) -> dict[str, Any]:
+    def _build_trade(
+        self,
+        candidate: SignalCandidate,
+        level: int,
+        stop_loss_pips: float | None = None,
+        take_profit_pips: float | None = None,
+    ) -> dict[str, Any]:
+        stop_pips = float(stop_loss_pips) if stop_loss_pips is not None else float(self.settings.stop_loss_pips)
+        take_pips = float(take_profit_pips) if take_profit_pips is not None else float(self.settings.take_profit_pips)
         multiplier = self.settings.ladder_step_ratio ** (level - 1)
         price = candidate.price
         if candidate.direction == "buy":
-            price = price + (self.settings.stop_loss_pips * self.settings.pip_size) * multiplier
+            price = price + (stop_pips * self.settings.pip_size) * multiplier
         else:
-            price = price - (self.settings.stop_loss_pips * self.settings.pip_size) * multiplier
+            price = price - (stop_pips * self.settings.pip_size) * multiplier
 
-        tp_base = self.settings.take_profit_pips
+        tp_base = take_pips
         tp_increment = tp_base * self.settings.ladder_step_ratio
         take_profit_pips = tp_base + (tp_increment * (level - 1))
         return {
@@ -72,7 +85,7 @@ class GoldTradeManager:
             "reason": candidate.reason,
             "entry_price": round(price, 5),
             "take_profit_pips": round(take_profit_pips, 2),
-            "stop_loss_pips": round(self.settings.stop_loss_pips, 2),
+            "stop_loss_pips": round(stop_pips, 2),
             "level": level,
         }
 
@@ -122,25 +135,7 @@ class GoldTradeManager:
         if fixed_lot_size > 0:
             return self._normalize_volume(fixed_lot_size, symbol_info)
 
-        if not account_info or not symbol_info or stop_distance <= 0:
-            return default_volume
-
-        balance = float(account_info.get("equity") or account_info.get("balance") or 0.0)
-        if balance <= 0:
-            return default_volume
-
-        risk_amount = balance * (float(self.settings.risk_percent) / 100.0)
-        tick_size = float(symbol_info.get("trade_tick_size") or 0.0)
-        tick_value = float(symbol_info.get("trade_tick_value") or 0.0)
-        if tick_size <= 0 or tick_value <= 0:
-            return default_volume
-
-        stop_ticks = stop_distance / tick_size
-        if stop_ticks <= 0:
-            return default_volume
-
-        raw_volume = risk_amount / (stop_ticks * tick_value)
-        return self._normalize_volume(raw_volume, symbol_info)
+        return self._normalize_volume(default_volume, symbol_info)
 
     def _normalize_volume(self, raw_volume: float, symbol_info: dict[str, Any] | None) -> float:
         if not symbol_info:

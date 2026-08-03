@@ -70,7 +70,11 @@ class GoldBacktestService:
         breakeven = 0
         margin_rejections = 0
         volume_cap_events = 0
-        sizing_rule = "risk_percent"
+        sizing_rule = "default_minimum_volume"
+        strategy_names = [name.strip().lower() for name in self.settings.strategy_names if str(name).strip()]
+        if not strategy_names:
+            strategy_names = ["trend_following"]
+        self._log_enabled_strategy_configs(strategy_names)
         volume_samples: list[float] = []
         processed_bars = 0
         status = "completed"
@@ -125,9 +129,20 @@ class GoldBacktestService:
                     }
                 logger.info("📍 Position monitor | open_positions=%s strategy=%s", len(self._open_positions), "backtest")
 
-                candidates = self.runner.evaluate_candidates(lower_slab, higher_frame=higher_slab)
+                candidates: list[Any] = []
+                for strategy_name in strategy_names:
+                    candidates.extend(
+                        self.runner.evaluate_candidates(
+                            lower_slab,
+                            higher_frame=higher_slab,
+                            strategy_names=[strategy_name],
+                        )
+                    )
                 logger.info("📈 Cycle %s generated %s candidate signal(s)", idx + 1, len(candidates))
                 for candidate in candidates:
+                    preset = self._strategy_runtime_config(str(getattr(candidate, "strategy", "")))
+                    stop_loss_pips = float(preset["stop_loss_pips"])
+                    take_profit_pips = float(preset["take_profit_pips"])
                     raw_volume, sizing_rule = self._resolve_backtest_volume(equity)
                     volume, was_capped = self._normalize_backtest_volume(raw_volume, profile)
                     signal_key = f"{requested_symbol}:{candidate.strategy}:{candidate.direction}:{ts.isoformat()}"
@@ -224,14 +239,18 @@ class GoldBacktestService:
                         candidate.reason,
                         float(candidate.price),
                     )
-                    ladder_entries = self.runner.trade_manager.build_ladder(candidate)
+                    ladder_entries = self.runner.trade_manager.build_ladder(
+                        candidate,
+                        stop_loss_pips=stop_loss_pips,
+                        take_profit_pips=take_profit_pips,
+                    )
                     for ladder_trade in ladder_entries:
                         trade_markers = self._build_trade_level_markers(
                             ts=ts,
                             direction=candidate.direction,
                             entry_price=float(ladder_trade.get("entry_price", candidate.price)),
-                            stop_loss_pips=float(ladder_trade.get("stop_loss_pips", self.settings.stop_loss_pips)),
-                            take_profit_pips=float(ladder_trade.get("take_profit_pips", self.settings.take_profit_pips)),
+                            stop_loss_pips=float(ladder_trade.get("stop_loss_pips", stop_loss_pips)),
+                            take_profit_pips=float(ladder_trade.get("take_profit_pips", take_profit_pips)),
                         )
                         markers.extend(trade_markers)
                         entry_price = float(trade_markers[0]["price"]) if trade_markers else float(candidate.price)
@@ -258,8 +277,8 @@ class GoldBacktestService:
                                 "direction": candidate.direction,
                                 "volume": float(volume),
                                 "entry_price": float(ladder_trade.get("entry_price", candidate.price)),
-                                "stop_loss": float(entry_price) - (float(ladder_trade.get("stop_loss_pips", self.settings.stop_loss_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))) if candidate.direction.lower() == "buy" else float(entry_price) + (float(ladder_trade.get("stop_loss_pips", self.settings.stop_loss_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))),
-                                "take_profit": float(entry_price) + (float(ladder_trade.get("take_profit_pips", self.settings.take_profit_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))) if candidate.direction.lower() == "buy" else float(entry_price) - (float(ladder_trade.get("take_profit_pips", self.settings.take_profit_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))),
+                                "stop_loss": float(entry_price) - (float(ladder_trade.get("stop_loss_pips", stop_loss_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))) if candidate.direction.lower() == "buy" else float(entry_price) + (float(ladder_trade.get("stop_loss_pips", stop_loss_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))),
+                                "take_profit": float(entry_price) + (float(ladder_trade.get("take_profit_pips", take_profit_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))) if candidate.direction.lower() == "buy" else float(entry_price) - (float(ladder_trade.get("take_profit_pips", take_profit_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))),
                                 "strategy": candidate.strategy,
                                 "source": "backtest",
                                 "is_external": 0,
@@ -276,8 +295,8 @@ class GoldBacktestService:
                                 "direction": candidate.direction,
                                 "volume": float(volume),
                                 "entry_price": float(ladder_trade.get("entry_price", candidate.price)),
-                                "stop_loss": float(entry_price) - (float(ladder_trade.get("stop_loss_pips", self.settings.stop_loss_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))) if candidate.direction.lower() == "buy" else float(entry_price) + (float(ladder_trade.get("stop_loss_pips", self.settings.stop_loss_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))),
-                                "take_profit": float(entry_price) + (float(ladder_trade.get("take_profit_pips", self.settings.take_profit_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))) if candidate.direction.lower() == "buy" else float(entry_price) - (float(ladder_trade.get("take_profit_pips", self.settings.take_profit_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))),
+                                "stop_loss": float(entry_price) - (float(ladder_trade.get("stop_loss_pips", stop_loss_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))) if candidate.direction.lower() == "buy" else float(entry_price) + (float(ladder_trade.get("stop_loss_pips", stop_loss_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))),
+                                "take_profit": float(entry_price) + (float(ladder_trade.get("take_profit_pips", take_profit_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))) if candidate.direction.lower() == "buy" else float(entry_price) - (float(ladder_trade.get("take_profit_pips", take_profit_pips)) * max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))),
                                 "strategy": candidate.strategy,
                                 "source": "backtest",
                                 "is_external": 0,
@@ -290,8 +309,8 @@ class GoldBacktestService:
                         "direction": candidate.direction,
                         "reason": candidate.reason,
                         "entry_price": round(float(candidate.price), 5),
-                        "take_profit_pips": round(self.settings.take_profit_pips, 2),
-                        "stop_loss_pips": round(self.settings.stop_loss_pips, 2),
+                        "take_profit_pips": round(take_profit_pips, 2),
+                        "stop_loss_pips": round(stop_loss_pips, 2),
                         "volume": round(volume, 2),
                         "sizing_rule": sizing_rule,
                         "level": 1,
@@ -301,10 +320,10 @@ class GoldBacktestService:
                         entry_price=float(candidate.price),
                         current_price=float(candidate.price),
                         direction=candidate.direction,
-                        stop_loss_pips=float(self.settings.stop_loss_pips),
-                        take_profit_pips=float(self.settings.take_profit_pips),
-                        move_sl_pips=max(1.0, float(self.settings.stop_loss_pips) / 2.0),
-                        move_tp_pips=max(1.0, float(self.settings.take_profit_pips) / 2.0),
+                        stop_loss_pips=stop_loss_pips,
+                        take_profit_pips=take_profit_pips,
+                        move_sl_pips=max(1.0, stop_loss_pips / 2.0),
+                        move_tp_pips=max(1.0, take_profit_pips / 2.0),
                     )
                     signal["stop_loss"] = exit_targets["stop_loss"]
                     signal["take_profit"] = exit_targets["take_profit"]
@@ -381,7 +400,7 @@ class GoldBacktestService:
         table_rows = [
             {"metric": "status", "value": str(result.get("status", "unknown"))},
             {"metric": "profile_source", "value": str(result.get("profile_source", "defaults"))},
-            {"metric": "sizing_rule", "value": str(result.get("sizing_rule", "risk_percent"))},
+            {"metric": "sizing_rule", "value": str(result.get("sizing_rule", "default_minimum_volume"))},
             {"metric": "avg_volume", "value": f"{float(result.get('avg_volume', 0.0)):.2f}"},
             {"metric": "volume_cap_events", "value": str(result.get("volume_cap_events", 0))},
             {"metric": "margin_rejections", "value": str(result.get("margin_rejections", 0))},
@@ -536,11 +555,48 @@ class GoldBacktestService:
         if fixed_lot_size > 0:
             return max(0.01, fixed_lot_size), "gold_fixed_lot_size"
 
-        risk_pct = max(0.0, float(getattr(self.settings, "risk_percent", 1.0)))
-        stop_loss_pips = max(1.0, float(getattr(self.settings, "stop_loss_pips", 120.0)))
-        risk_amount = max(0.0, equity) * (risk_pct / 100.0)
-        estimated_volume = risk_amount / stop_loss_pips
-        return max(0.01, estimated_volume), "risk_percent"
+        return 0.01, "default_minimum_volume"
+
+    def _strategy_runtime_config(self, strategy_name: str) -> dict[str, Any]:
+        key = str(strategy_name).strip().lower()
+        preset = self.settings.strategy_presets.get(key) if hasattr(self.settings, "strategy_presets") else None
+        if preset is None:
+            return {
+                "lower_timeframe": self.settings.lower_timeframe,
+                "higher_timeframe": self.settings.higher_timeframe,
+                "stop_loss_pips": float(self.settings.stop_loss_pips),
+                "take_profit_pips": float(self.settings.take_profit_pips),
+            }
+        return {
+            "lower_timeframe": str(preset.lower_timeframe).upper(),
+            "higher_timeframe": str(preset.higher_timeframe).upper(),
+            "stop_loss_pips": float(preset.stop_loss_pips),
+            "take_profit_pips": float(preset.take_profit_pips),
+        }
+
+    def _log_enabled_strategy_configs(self, strategy_names: list[str]) -> None:
+        env_path = str(getattr(self.settings, "config_env_path", ".env"))
+        logger.info(
+            "🧩 Strategy setup overview | env=%s enabled_strategies=%s",
+            env_path,
+            ",".join(strategy_names),
+        )
+        for strategy_name in strategy_names:
+            preset = self._strategy_runtime_config(strategy_name)
+            config_source = "strategy_preset" if strategy_name in getattr(self.settings, "strategy_presets", {}) else "fallback_defaults"
+            logger.info(
+                "🧩 Strategy setup | enabled=true strategy=%s source=%s ltf=%s htf=%s sl_pips=%.2f tp_pips=%.2f multi_entry=%s ladder_entries=%s ladder_step_ratio=%.2f fixed_lot=%.2f",
+                strategy_name,
+                config_source,
+                str(preset["lower_timeframe"]),
+                str(preset["higher_timeframe"]),
+                float(preset["stop_loss_pips"]),
+                float(preset["take_profit_pips"]),
+                bool(self.settings.enable_multi_entry),
+                int(self.settings.ladder_entries),
+                float(self.settings.ladder_step_ratio),
+                float(self.settings.fixed_lot_size),
+            )
 
     def _normalize_backtest_volume(self, raw_volume: float, profile: dict[str, float | str]) -> tuple[float, bool]:
         min_volume = max(0.01, float(profile.get("volume_min", 0.01) or 0.01))

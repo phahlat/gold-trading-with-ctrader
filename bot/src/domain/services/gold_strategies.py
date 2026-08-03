@@ -26,24 +26,32 @@ class GoldStrategyEngine:
     def __init__(self, strategy_names: list[str]) -> None:
         self.strategy_names = [name.lower() for name in strategy_names]
 
-    def evaluate(self, frame: pd.DataFrame, settings: object, higher_frame: pd.DataFrame | None = None) -> list[SignalCandidate]:
+    def evaluate(
+        self,
+        frame: pd.DataFrame,
+        settings: object,
+        higher_frame: pd.DataFrame | None = None,
+        strategy_names: list[str] | None = None,
+    ) -> list[SignalCandidate]:
         candidates: list[SignalCandidate] = []
         if frame.empty:
             return candidates
+
+        active_strategies = {name.strip().lower() for name in (strategy_names or self.strategy_names) if str(name).strip()}
 
         close = frame["close"].astype(float)
         high = frame["high"].astype(float)
         low = frame["low"].astype(float)
 
-        if "trend_following" in self.strategy_names:
+        if "trend_following" in active_strategies:
             candidates.extend(self._trend_following(close, frame, settings))
-        if "price_action" in self.strategy_names:
+        if "price_action" in active_strategies:
             candidates.extend(self._price_action(close, frame))
-        if "scalping" in self.strategy_names:
+        if "scalping" in active_strategies:
             candidates.extend(self._scalping(close, frame, settings))
-        if "news" in self.strategy_names:
+        if "news" in active_strategies:
             candidates.extend(self._news(close, high, low, frame))
-        if "session_breakout" in self.strategy_names:
+        if "session_breakout" in active_strategies:
             candidates.extend(self._session_breakout(close, frame))
 
         return self._apply_higher_timeframe_bias(candidates, higher_frame, settings)

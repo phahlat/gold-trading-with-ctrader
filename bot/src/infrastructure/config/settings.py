@@ -8,6 +8,14 @@ from dotenv import load_dotenv
 
 
 @dataclass(frozen=True)
+class StrategyPreset:
+    lower_timeframe: str
+    higher_timeframe: str
+    stop_loss_pips: float
+    take_profit_pips: float
+
+
+@dataclass(frozen=True)
 class GoldSettings:
     ctrader_client_id: str
     ctrader_client_secret: str
@@ -19,10 +27,12 @@ class GoldSettings:
     ctrader_host: str
     ctrader_request_timeout_seconds: float
     ctrader_connect_timeout_seconds: float
+    ctrader_reconnect_attempts: int
+    ctrader_reconnect_wait_seconds: float
     enable_trading: bool
     plot_enabled: bool
     symbols: list[str]
-    timeframe: str
+    strategy_presets: dict[str, StrategyPreset]
     lower_timeframe: str
     higher_timeframe: str
     candle_count: int
@@ -64,14 +74,12 @@ class GoldSettings:
     ladder_entries: int
     ladder_step_ratio: float
     fixed_lot_size: float
-    risk_percent: float
     stop_loss_pips: float
     take_profit_pips: float
     ema_fast: int
     ema_slow: int
     ema_trend_period: int
     max_daily_trades: int
-    max_daily_risk_pct: float
     max_open_positions: int
     trade_magic_number: int
     trade_comment_prefix: str
@@ -152,6 +160,21 @@ def _resolve_env_path(env_path: str) -> Path:
     return raw_path.resolve()
 
 
+def _strategy_preset_env(
+    prefix: str,
+    default_ltf: str,
+    default_htf: str,
+    default_stop_loss_pips: float,
+    default_take_profit_pips: float,
+) -> StrategyPreset:
+    return StrategyPreset(
+        lower_timeframe=os.getenv(f"{prefix}_LTF", default_ltf).strip().upper(),
+        higher_timeframe=os.getenv(f"{prefix}_HTF", default_htf).strip().upper(),
+        stop_loss_pips=max(1.0, _float_env(f"{prefix}_GOLD_STOP_LOSS_PIPS", default_stop_loss_pips)),
+        take_profit_pips=max(1.0, _float_env(f"{prefix}_GOLD_TAKE_PROFIT_PIPS", default_take_profit_pips)),
+    )
+
+
 def load_gold_settings(env_path: str = ".env") -> GoldSettings:
     resolved_env_path = _resolve_env_path(env_path)
     if resolved_env_path.name != ".env" and resolved_env_path.suffix != ".env":
@@ -162,7 +185,16 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
     load_dotenv(str(resolved_env_path), override=False)
     backtest_speed_ms = _required_backtest_speed_ms()
 
-    strategy_names = [s.strip() for s in os.getenv("GOLD_STRATEGY_NAMES", "trend_following,price_action,scalping").split(",") if s.strip()]
+    strategy_names = [s.strip().lower() for s in os.getenv("GOLD_STRATEGY_NAMES", "trend_following,price_action,scalping").split(",") if s.strip()]
+    strategy_presets: dict[str, StrategyPreset] = {
+        "trend_following": _strategy_preset_env("TREND_FOLLOWING", "M15", "H1", 120.0, 250.0),
+        "price_action": _strategy_preset_env("PRICE_ACTION", "M5", "M30", 80.0, 180.0),
+        "scalping": _strategy_preset_env("SCALPING", "M5", "M30", 40.0, 90.0),
+        "news": _strategy_preset_env("NEWS", "M5", "M30", 60.0, 140.0),
+        "session_breakout": _strategy_preset_env("SESSION_BREAKOUT", "M15", "H1", 100.0, 220.0),
+    }
+    primary_strategy = strategy_names[0] if strategy_names and strategy_names[0] in strategy_presets else "trend_following"
+    primary_preset = strategy_presets[primary_strategy]
     return GoldSettings(
         ctrader_client_id=os.getenv("CTRADER_CLIENT_ID", ""),
         ctrader_client_secret=os.getenv("CTRADER_CLIENT_SECRET", ""),
@@ -174,12 +206,14 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
         ctrader_host=os.getenv("CTRADER_HOST", "live").strip().lower(),
         ctrader_request_timeout_seconds=max(2.0, _float_env("CTRADER_REQUEST_TIMEOUT_SECONDS", 12.0)),
         ctrader_connect_timeout_seconds=max(3.0, _float_env("CTRADER_CONNECT_TIMEOUT_SECONDS", 15.0)),
+        ctrader_reconnect_attempts=max(1, _int_env("CTRADER_RECONNECT_ATTEMPTS", 5)),
+        ctrader_reconnect_wait_seconds=max(0.0, _float_env("CTRADER_RECONNECT_WAIT_SECONDS", 30.0)),
         enable_trading=_bool_env(os.getenv("ENABLE_TRADING"), default=True),
         plot_enabled=_bool_env(os.getenv("PLOT_ENABLED"), default=True),
         symbols=[s.strip().upper() for s in os.getenv("SYMBOLS", "XAUUSD").split(",") if s.strip()],
-        timeframe=os.getenv("TIMEFRAME", "M15").upper(),
-        lower_timeframe=os.getenv("LOWER_TIMEFRAME", os.getenv("TIMEFRAME", "M15")).upper(),
-        higher_timeframe=os.getenv("HIGHER_TIMEFRAME", "H1").upper(),
+        strategy_presets=strategy_presets,
+        lower_timeframe=primary_preset.lower_timeframe,
+        higher_timeframe=primary_preset.higher_timeframe,
         candle_count=_int_env("CANDLE_COUNT", 200),
         refresh_candle_count=max(2, _int_env("REFRESH_CANDLE_COUNT", 5)),
         poll_seconds=_float_env("POLL_SECONDS", 0.5),
@@ -222,14 +256,12 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
         ladder_entries=_int_env("GOLD_LADDER_ENTRIES", 3),
         ladder_step_ratio=max(0.01, _float_env("GOLD_LADDER_STEP_RATIO", 1.2)),
         fixed_lot_size=max(0.0, _float_env("GOLD_FIXED_LOT_SIZE", 0.0)),
-        risk_percent=_float_env("GOLD_RISK_PERCENT", 1.0),
-        stop_loss_pips=_float_env("GOLD_STOP_LOSS_PIPS", 120.0),
-        take_profit_pips=_float_env("GOLD_TAKE_PROFIT_PIPS", 250.0),
+        stop_loss_pips=primary_preset.stop_loss_pips,
+        take_profit_pips=primary_preset.take_profit_pips,
         ema_fast=_int_env("GOLD_EMA_FAST", 9),
         ema_slow=_int_env("GOLD_EMA_SLOW", 21),
         ema_trend_period=_int_env("GOLD_EMA_TREND_PERIOD", 200),
         max_daily_trades=_int_env("GOLD_MAX_DAILY_TRADES", 3),
-        max_daily_risk_pct=_float_env("GOLD_MAX_DAILY_RISK_PCT", 3.0),
         max_open_positions=max(1, _int_env("GOLD_MAX_OPEN_POSITIONS", 2)),
         trade_magic_number=_int_env("GOLD_TRADE_MAGIC_NUMBER", 550015),
         trade_comment_prefix=os.getenv("GOLD_TRADE_COMMENT_PREFIX", "gold-bot"),
