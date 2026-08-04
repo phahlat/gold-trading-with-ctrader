@@ -96,6 +96,25 @@ def test_connector_retries_initial_connect_on_transient_failure(monkeypatch) -> 
     assert connector._connected is True
 
 
+def test_ctrader_volume_unit_conversion_uses_lots() -> None:
+    settings = SimpleNamespace(
+        ctrader_client_id="id",
+        ctrader_client_secret="secret",
+        ctrader_access_token="token",
+        ctrader_refresh_token="refresh",
+        ctrader_account_id=123,
+        ctrader_host="demo",
+        ctrader_request_timeout_seconds=3.0,
+        ctrader_connect_timeout_seconds=3.0,
+    )
+    connector = GoldCTraderConnector(settings)
+
+    assert connector._volume_from_api(100) == 0.01
+    assert connector._volume_from_api(1000000) == 100.0
+    assert connector._volume_to_api(0.01) == 100
+    assert connector._volume_to_api(1.0) == 10000
+
+
 def test_connector_marks_stale_socket_for_reconnect(monkeypatch) -> None:
     settings = SimpleNamespace(
         ctrader_client_id="id",

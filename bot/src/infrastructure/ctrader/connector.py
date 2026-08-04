@@ -89,6 +89,12 @@ class GoldCTraderConnector:
         self._heartbeat_loop: LoopingCall | None = None
         self._reconnect_timer: Any | None = None
 
+    def _volume_from_api(self, raw_volume: int | float) -> float:
+        return float(raw_volume or 0.0) / 10000.0
+
+    def _volume_to_api(self, volume_lots: int | float) -> int:
+        return max(1, int(round(float(volume_lots) * 10000.0)))
+
     def connect(self) -> bool:
         if self._connected:
             return True
@@ -353,7 +359,7 @@ class GoldCTraderConnector:
 
             side = int(getattr(trade_data, "tradeSide", 0))
             direction = 0 if side == ProtoOATradeSide.Value("BUY") else 1
-            volume = float(getattr(trade_data, "volume", 0.0)) / 100.0
+            volume = self._volume_from_api(getattr(trade_data, "volume", 0.0))
             opened_ms = int(getattr(trade_data, "openTimestamp", 0) or 0)
             position_id = int(getattr(item, "positionId", 0) or 0)
 
@@ -397,7 +403,7 @@ class GoldCTraderConnector:
         req.symbolId = symbol_id
         req.orderType = ProtoOAOrderType.Value("MARKET")
         req.tradeSide = ProtoOATradeSide.Value("BUY" if direction.lower() == "buy" else "SELL")
-        req.volume = max(1, int(round(float(volume) * 100.0)))
+        req.volume = self._volume_to_api(volume)
         req.stopLoss = float(stop_loss)
         req.takeProfit = float(take_profit)
         req.comment = comment
@@ -679,9 +685,9 @@ class GoldCTraderConnector:
         digits = int(getattr(item, "digits", 2) or 2)
         point = 10 ** (-digits)
 
-        min_volume = float(getattr(item, "minVolume", 0) or 0) / 100.0
-        max_volume = float(getattr(item, "maxVolume", 0) or 0) / 100.0
-        step_volume = float(getattr(item, "stepVolume", 0) or 0) / 100.0
+        min_volume = self._volume_from_api(getattr(item, "minVolume", 0) or 0)
+        max_volume = self._volume_from_api(getattr(item, "maxVolume", 0) or 0)
+        step_volume = self._volume_from_api(getattr(item, "stepVolume", 0) or 0)
 
         lot_size = float(getattr(item, "lotSize", 100) or 100.0)
         return {

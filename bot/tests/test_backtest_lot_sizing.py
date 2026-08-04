@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
+import bot.src.application.services.gold_backtest_service as gold_backtest_service_module
 from bot.src.application.services.gold_backtest_service import GoldBacktestService
 from bot.src.application.services.gold_trade_manager import GoldTradeManager
 from bot.src.domain.services.gold_strategies import SignalCandidate
@@ -63,6 +64,94 @@ def test_backtest_volume_normalization_caps_to_profile_max() -> None:
 
     assert normalized == 2.0
     assert was_capped is True
+
+
+def test_backtest_volume_normalization_keeps_fixed_lot_at_broker_minimum() -> None:
+    settings = SimpleNamespace(backtest_max_volume_cap=0.0)
+    service = _service(settings)
+
+    normalized, was_capped = service._normalize_backtest_volume(
+        raw_volume=0.01,
+        profile={"volume_min": 0.01, "volume_max": 100.0, "volume_step": 0.01},
+    )
+
+    assert normalized == 0.01
+    assert was_capped is False
+
+
+def test_backtest_broker_profile_preserves_point_zero_one_lot_size(monkeypatch) -> None:
+    settings = SimpleNamespace(
+        backtest_use_broker_profile=True,
+        backtest_volume_min=0.01,
+        backtest_volume_max=50.0,
+        backtest_volume_step=0.01,
+        backtest_default_contract_size=100.0,
+        backtest_default_leverage=100.0,
+        symbols=["XAUUSD"],
+        backtest_max_volume_cap=0.0,
+    )
+    service = _service(settings)
+
+    class FakeConnector:
+        def __init__(self, _settings) -> None:
+            pass
+
+        def connect(self) -> bool:
+            return True
+
+        def disconnect(self) -> None:
+            return None
+
+        def resolve_symbol(self, requested_symbol: str) -> str:
+            return requested_symbol
+
+        def symbol_info(self, _symbol: str) -> dict[str, float]:
+            return {
+                "volume_min": 0.01,
+                "volume_max": 100.0,
+                "volume_step": 0.01,
+                "trade_contract_size": 10000.0,
+                "margin_initial": 0.0,
+            }
+
+        def account_info(self) -> dict[str, float]:
+            return {"leverage": 100.0}
+
+    monkeypatch.setattr(gold_backtest_service_module, "GoldCTraderConnector", FakeConnector)
+
+    profile = service._resolve_backtest_profile()
+    normalized, was_capped = service._normalize_backtest_volume(raw_volume=0.01, profile=profile)
+
+    assert profile["source"] == "ctrader"
+    assert profile["volume_min"] == 0.01
+    assert profile["volume_step"] == 0.01
+    assert normalized == 0.01
+    assert was_capped is False
+
+
+def test_build_order_request_respects_fixed_lot_size_of_point_zero_one() -> None:
+    settings = SimpleNamespace(
+        pip_size=0.01,
+        stop_loss_pips=150.0,
+        take_profit_pips=450.0,
+        fixed_lot_size=0.01,
+        risk_percent=1.0,
+    )
+    manager = GoldTradeManager(settings)
+    candidate = SignalCandidate(strategy="trend_following", direction="buy", reason="test", price=4106.47)
+
+    order = manager.build_order_request(
+        candidate=candidate,
+        symbol="GOLD",
+        entry_price=4106.47,
+        account_info={"equity": 1000.0},
+        symbol_info={"volume_min": 0.01, "volume_max": 100.0, "volume_step": 0.01},
+        stop_loss_pips=150.0,
+        take_profit_pips=450.0,
+        level=1,
+    )
+
+    assert order["volume"] == 0.01
 
 
 def test_backtest_margin_rejection_triggers_when_required_margin_exceeds_equity() -> None:
