@@ -25,6 +25,7 @@ class GoldPositionStore:
                     stop_loss REAL,
                     take_profit REAL,
                     strategy TEXT,
+                    timeframes TEXT,
                     source TEXT,
                     is_external INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'open',
@@ -42,8 +43,8 @@ class GoldPositionStore:
                 """
                 INSERT INTO positions (
                     position_key, ticket, symbol, direction, volume, entry_price, stop_loss,
-                    take_profit, strategy, source, is_external, status, opened_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    take_profit, strategy, timeframes, source, is_external, status, opened_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_key) DO UPDATE SET
                     ticket=excluded.ticket,
                     symbol=excluded.symbol,
@@ -53,6 +54,7 @@ class GoldPositionStore:
                     stop_loss=excluded.stop_loss,
                     take_profit=excluded.take_profit,
                     strategy=excluded.strategy,
+                    timeframes=excluded.timeframes,
                     source=excluded.source,
                     is_external=excluded.is_external,
                     status=excluded.status,
@@ -68,6 +70,7 @@ class GoldPositionStore:
                     payload.get("stop_loss"),
                     payload.get("take_profit"),
                     payload.get("strategy"),
+                    payload.get("timeframes"),
                     payload.get("source"),
                     payload.get("is_external", 0),
                     payload.get("status", "open"),

@@ -601,6 +601,7 @@ class GoldLiveService:
                     "stop_loss": order["stop_loss"],
                     "take_profit": order["take_profit"],
                     "strategy": order["strategy"],
+                    "timeframes": f"{lower_timeframe}/{higher_timeframe}",
                     "source": "ctrader",
                     "is_external": 0,
                     "status": "open",
@@ -726,9 +727,17 @@ class GoldLiveService:
         self._last_positions = positions
         logger.info("📌 Position monitor | symbol=%s open_positions=%s", symbol, len(positions))
         now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        existing_positions = {
+            str(row.get("position_key", "")): row
+            for row in self.position_store.list_positions(status="open")
+            if row.get("position_key")
+        }
         for item in positions:
             position_key = f"ctrader:ticket-{item['ticket']}:{item['symbol']}"
             direction = "buy" if int(item.get("type", 0)) == 0 else "sell"
+            existing = existing_positions.get(position_key, {})
+            strategy = str(existing.get("strategy") or "external")
+            timeframes = str(existing.get("timeframes") or "")
             self.position_store.upsert_position(
                 {
                     "position_key": position_key,
@@ -739,7 +748,8 @@ class GoldLiveService:
                     "entry_price": item["price_open"],
                     "stop_loss": item["sl"],
                     "take_profit": item["tp"],
-                    "strategy": "external",
+                    "strategy": strategy,
+                    "timeframes": timeframes,
                     "source": "ctrader",
                     "is_external": 1,
                     "status": "open",
@@ -750,6 +760,8 @@ class GoldLiveService:
             {
                 "ticket": int(item.get("ticket", 0)),
                 "symbol": str(item.get("symbol", "")),
+                "strategy": str(item.get("strategy", "") or "external"),
+                "timeframes": str(item.get("timeframes", "") or ""),
                 "direction": "buy" if int(item.get("type", 0)) == 0 else "sell",
                 "volume": float(item.get("volume", 0.0)),
                 "entry": float(item.get("price_open", 0.0)),
@@ -760,8 +772,8 @@ class GoldLiveService:
             for item in positions
         ]
         if not position_rows:
-            position_rows = [{"ticket": "-", "symbol": "-", "direction": "-", "volume": 0.0, "entry": 0.0, "sl": 0.0, "tp": 0.0, "profit": 0.0}]
-        logger.info("📋 Open positions table:\n%s", self._format_table(position_rows, ["ticket", "symbol", "direction", "volume", "entry", "sl", "tp", "profit"]))
+            position_rows = [{"ticket": "-", "symbol": "-", "strategy": "-", "timeframes": "-", "direction": "-", "volume": 0.0, "entry": 0.0, "sl": 0.0, "tp": 0.0, "profit": 0.0}]
+        logger.info("📋 Open positions table:\n%s", self._format_table(position_rows, ["ticket", "symbol", "strategy", "timeframes", "direction", "volume", "entry", "sl", "tp", "profit"]))
 
     def _open_positions_with_recovery(self, symbol: str) -> list[dict[str, Any]] | None:
         try:

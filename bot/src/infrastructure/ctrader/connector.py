@@ -97,6 +97,9 @@ class GoldCTraderConnector:
         self._active_host_name = host_name
         self._active_host = host
         self._active_port = EndPoints.PROTOBUF_PORT
+        connect_timeout = max(2.0, float(getattr(self.settings, "ctrader_connect_timeout_seconds", 15.0)))
+        attempts = max(1, int(getattr(self.settings, "ctrader_reconnect_attempts", 3)))
+        wait_seconds = max(0.0, float(getattr(self.settings, "ctrader_reconnect_wait_seconds", 2.0)))
 
         logger.info(
             "cTrader Open API endpoints | protobuf_live=%s:%s protobuf_demo=%s:%s json_live=%s:%s json_demo=%s:%s",
@@ -116,31 +119,49 @@ class GoldCTraderConnector:
             EndPoints.PROTOBUF_PORT,
         )
 
-        try:
-            _ensure_reactor_running()
-            self._socket_connected_event.clear()
-            self._client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
-            self._client.setConnectedCallback(self._on_socket_connected)
-            self._client.setDisconnectedCallback(self._on_socket_disconnected)
-            self._client.setMessageReceivedCallback(self._on_message_received)
-            self._call_in_reactor(self._client.startService, timeout=max(2.0, float(getattr(self.settings, "ctrader_connect_timeout_seconds", 15.0))))
-            self._wait_for_socket_ready(float(getattr(self.settings, "ctrader_connect_timeout_seconds", 15.0)))
-            self._authenticate_application_and_account()
-            self._prime_symbol_catalog()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.exception("cTrader connection failed: %s", exc)
-            self.disconnect()
-            return False
+        for attempt in range(1, attempts + 1):
+            try:
+                _ensure_reactor_running()
+                self._socket_connected_event.clear()
+                self._client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
+                self._client.setConnectedCallback(self._on_socket_connected)
+                self._client.setDisconnectedCallback(self._on_socket_disconnected)
+                self._client.setMessageReceivedCallback(self._on_message_received)
+                self._call_in_reactor(
+                    self._client.startService,
+                    timeout=connect_timeout,
+                )
+                self._wait_for_socket_ready(connect_timeout)
+                self._authenticate_application_and_account()
+                self._prime_symbol_catalog()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "cTrader connection attempt %s/%s failed | mode=%s endpoint=%s:%s error=%s",
+                    attempt,
+                    attempts,
+                    host_name,
+                    host,
+                    EndPoints.PROTOBUF_PORT,
+                    exc,
+                )
+                self.disconnect()
+                if attempt < attempts and wait_seconds > 0:
+                    logger.info("⏳ Waiting %.1f seconds before retrying cTrader connection", wait_seconds)
+                    time.sleep(wait_seconds)
+                continue
 
-        self._connected = True
-        logger.info(
-            "cTrader connected | mode=%s endpoint=%s:%s account_id=%s",
-            host_name,
-            host,
-            EndPoints.PROTOBUF_PORT,
-            self._account_id,
-        )
-        return True
+            self._connected = True
+            logger.info(
+                "cTrader connected | mode=%s endpoint=%s:%s account_id=%s",
+                host_name,
+                host,
+                EndPoints.PROTOBUF_PORT,
+                self._account_id,
+            )
+            return True
+
+        logger.error("cTrader connection failed after %s attempt(s).", attempts)
+        return False
 
     def disconnect(self) -> None:
         if self._client and self._account_id is not None and self._subscribed_symbol_ids:
