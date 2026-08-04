@@ -253,7 +253,7 @@ class GoldCTraderConnector:
             req.ctidTraderAccountId = int(self._account_id)
             req.symbolId.append(symbol_id)
             response = self._send_and_extract(req)
-            for item in getattr(response, "symbol", []):
+            for item in self._iter_proto_items(getattr(response, "symbol", None)):
                 self._symbol_meta_by_id[int(item.symbolId)] = self._normalize_symbol_meta(item)
 
         meta = self._symbol_meta_by_id.get(symbol_id)
@@ -302,7 +302,7 @@ class GoldCTraderConnector:
             pnl_req.ctidTraderAccountId = int(self._account_id)
             pnl_res = self._send_and_extract(pnl_req)
             pnl_digits = int(getattr(pnl_res, "moneyDigits", 2) or 2)
-            for item in getattr(pnl_res, "positionUnrealizedPnL", []):
+            for item in self._iter_proto_items(getattr(pnl_res, "positionUnrealizedPnL", None)):
                 position_id = int(getattr(item, "positionId", 0) or 0)
                 unrealized = self._money_to_float(getattr(item, "netUnrealizedPnL", 0), pnl_digits)
                 if position_id > 0:
@@ -311,7 +311,7 @@ class GoldCTraderConnector:
             logger.debug("Unable to fetch unrealized PnL map: %s", exc)
 
         positions: list[dict[str, Any]] = []
-        for item in getattr(response, "position", []):
+        for item in self._iter_proto_items(getattr(response, "position", None)):
             trade_data = getattr(item, "tradeData", None)
             if trade_data is None:
                 continue
@@ -623,7 +623,7 @@ class GoldCTraderConnector:
 
         self._symbols_by_name.clear()
         self._symbols_by_id.clear()
-        for item in getattr(response, "symbol", []):
+        for item in self._iter_proto_items(getattr(response, "symbol", None)):
             symbol_name = str(getattr(item, "symbolName", "") or "").strip().upper()
             symbol_id = int(getattr(item, "symbolId", 0) or 0)
             if not symbol_name or symbol_id <= 0:
@@ -677,6 +677,22 @@ class GoldCTraderConnector:
     def _money_to_float(self, value: int | float, digits: int) -> float:
         scale = float(10 ** max(0, int(digits)))
         return float(value) / scale if scale > 0 else float(value)
+
+    def _iter_proto_items(self, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, (str, bytes, dict)):
+            return [value]
+        if hasattr(value, "__iter__"):
+            try:
+                return list(value)
+            except TypeError:
+                return [value]
+        return [value]
 
     def _on_message_received(self, _client: Client, message: Any) -> None:
         payload = Protobuf.extract(message)

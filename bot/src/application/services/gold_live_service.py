@@ -171,11 +171,19 @@ class GoldLiveService:
 
                     now = time.monotonic()
                     if now - last_position_monitor >= self.settings.position_monitor_seconds:
-                        self._monitor_positions(symbol)
+                        try:
+                            self._monitor_positions(symbol)
+                        except Exception as exc:
+                            logger.exception("⚠️ Position monitor failed | symbol=%s", symbol)
+                            if not self._recover_from_monitor_failure(symbol, exc):
+                                logger.error("❌ Position monitor recovery failed; will retry on next cycle | symbol=%s", symbol)
                         last_position_monitor = now
 
                     if now - last_account_monitor >= self.settings.account_monitor_seconds:
-                        self._monitor_account()
+                        try:
+                            self._monitor_account()
+                        except Exception:
+                            logger.exception("⚠️ Account monitor failed | symbol=%s", symbol)
                         last_account_monitor = now
 
                     if self.settings.plot_enabled and now - last_plot_update >= self.settings.chart_update_seconds:
@@ -437,7 +445,15 @@ class GoldLiveService:
             return
 
         today_key = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-        open_positions = self.connector.open_positions(symbol=symbol)
+        open_positions = self._open_positions_with_recovery(symbol)
+        if open_positions is None:
+            logger.info(
+                "⛔ Signal skipped after position lookup failure | key=%s strategy=%s direction=%s",
+                signal_key,
+                candidate.strategy,
+                candidate.direction,
+            )
+            return
         strategy_open_positions = self._count_open_positions_by_strategy(open_positions)
         ladder_target = max(1, int(self.settings.ladder_entries if self.settings.enable_multi_entry else 1))
         current_strategy_open = int(strategy_open_positions.get(strategy_name, 0))
@@ -704,7 +720,9 @@ class GoldLiveService:
             self._signal_markers_by_timeframe[timeframe] = markers[-300:]
 
     def _monitor_positions(self, symbol: str) -> None:
-        positions = self.connector.open_positions(symbol=symbol)
+        positions = self._open_positions_with_recovery(symbol)
+        if positions is None:
+            raise RuntimeError(f"Unable to retrieve positions for {symbol}")
         self._last_positions = positions
         logger.info("📌 Position monitor | symbol=%s open_positions=%s", symbol, len(positions))
         now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
@@ -744,6 +762,25 @@ class GoldLiveService:
         if not position_rows:
             position_rows = [{"ticket": "-", "symbol": "-", "direction": "-", "volume": 0.0, "entry": 0.0, "sl": 0.0, "tp": 0.0, "profit": 0.0}]
         logger.info("📋 Open positions table:\n%s", self._format_table(position_rows, ["ticket", "symbol", "direction", "volume", "entry", "sl", "tp", "profit"]))
+
+    def _open_positions_with_recovery(self, symbol: str) -> list[dict[str, Any]] | None:
+        try:
+            return self.connector.open_positions(symbol=symbol)
+        except Exception as exc:
+            logger.exception("⚠️ Open positions lookup failed | symbol=%s", symbol)
+            if not self._recover_from_monitor_failure(symbol, exc):
+                return None
+            try:
+                return self.connector.open_positions(symbol=symbol)
+            except Exception:
+                logger.exception("⚠️ Open positions retry failed | symbol=%s", symbol)
+                return None
+
+    def _recover_from_monitor_failure(self, symbol: str, exc: Exception) -> bool:
+        if not self._is_connection_error(exc):
+            logger.warning("⚠️ Non-connection monitor failure detected; attempting reconnect anyway | symbol=%s", symbol)
+        recovered_symbol = self._recover_connection(symbol)
+        return recovered_symbol is not None
 
     def _monitor_account(self) -> None:
         account_info = self.connector.account_info()
