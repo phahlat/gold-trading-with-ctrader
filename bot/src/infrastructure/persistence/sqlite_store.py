@@ -26,6 +26,7 @@ class GoldPositionStore:
                     take_profit REAL,
                     strategy TEXT,
                     timeframes TEXT,
+                    comment TEXT,
                     source TEXT,
                     is_external INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'open',
@@ -35,6 +36,9 @@ class GoldPositionStore:
                 )
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+            if "comment" not in columns:
+                conn.execute("ALTER TABLE positions ADD COLUMN comment TEXT")
             conn.commit()
 
     def upsert_position(self, payload: dict[str, Any]) -> None:
@@ -43,8 +47,8 @@ class GoldPositionStore:
                 """
                 INSERT INTO positions (
                     position_key, ticket, symbol, direction, volume, entry_price, stop_loss,
-                    take_profit, strategy, timeframes, source, is_external, status, opened_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    take_profit, strategy, timeframes, comment, source, is_external, status, opened_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_key) DO UPDATE SET
                     ticket=excluded.ticket,
                     symbol=excluded.symbol,
@@ -55,6 +59,7 @@ class GoldPositionStore:
                     take_profit=excluded.take_profit,
                     strategy=excluded.strategy,
                     timeframes=excluded.timeframes,
+                    comment=excluded.comment,
                     source=excluded.source,
                     is_external=excluded.is_external,
                     status=excluded.status,
@@ -71,12 +76,18 @@ class GoldPositionStore:
                     payload.get("take_profit"),
                     payload.get("strategy"),
                     payload.get("timeframes"),
+                    payload.get("comment"),
                     payload.get("source"),
                     payload.get("is_external", 0),
                     payload.get("status", "open"),
                     payload.get("opened_at"),
                 ),
             )
+            conn.commit()
+
+    def delete_position(self, position_key: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM positions WHERE position_key = ?", (position_key,))
             conn.commit()
 
     def list_positions(self, status: str | None = None) -> list[dict[str, Any]]:

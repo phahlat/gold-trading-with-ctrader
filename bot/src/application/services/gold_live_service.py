@@ -4,7 +4,7 @@ import logging
 import math
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -34,6 +34,7 @@ class GoldLiveService:
         self.chart_renderer = chart_renderer
         self._signal_markers_by_timeframe: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._last_signal_keys: set[str] = set()
+        self._strategy_cooldowns: dict[str, datetime] = {}
         self._daily_trade_count: dict[str, int] = defaultdict(int)
         self._daily_risk_pct: dict[str, float] = defaultdict(float)
         self._last_account_snapshot: dict[str, Any] | None = None
@@ -470,6 +471,17 @@ class GoldLiveService:
             )
             return
 
+        execution_now = datetime.now(timezone.utc)
+        if not self._is_strategy_execution_allowed(strategy_name, execution_now):
+            cooldown_minutes = self._cooldown_minutes_for_strategy(strategy_name)
+            logger.info(
+                "⏳ Signal skipped (cooldown active) | key=%s strategy=%s cooldown_minutes=%.1f",
+                signal_key,
+                candidate.strategy,
+                cooldown_minutes,
+            )
+            return
+
         ladder_entries = self.runner.trade_manager.build_ladder(
             candidate,
             stop_loss_pips=stop_loss_pips,
@@ -589,7 +601,7 @@ class GoldLiveService:
                 continue
 
             now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
-            position_key = f"bot:ticket-{order_result.get('order', 0)}:{symbol}"
+            position_key = f"ctrader:ticket-{order_result.get('order', 0)}:{symbol}"
             self.position_store.upsert_position(
                 {
                     "position_key": position_key,
@@ -602,6 +614,7 @@ class GoldLiveService:
                     "take_profit": order["take_profit"],
                     "strategy": order["strategy"],
                     "timeframes": f"{lower_timeframe}/{higher_timeframe}",
+                    "comment": order_comment,
                     "source": "ctrader",
                     "is_external": 0,
                     "status": "open",
@@ -618,6 +631,7 @@ class GoldLiveService:
             )
             self._daily_trade_count[today_key] += 1
             self._orders_filled += 1
+            self._mark_strategy_executed(strategy_name, execution_now)
             logger.info(
                 "✅ Trade executed | key=%s symbol=%s strategy=%s level=%s ticket=%s direction=%s volume=%.2f entry=%.5f sl=%.5f tp=%.5f filling=%s",
                 signal_key,
@@ -632,6 +646,32 @@ class GoldLiveService:
                 float(order["take_profit"]),
                 order_result.get("filling"),
             )
+
+    def _cooldown_minutes_for_strategy(self, strategy_name: str) -> float:
+        key = str(strategy_name).strip().lower()
+        if key == "price_action":
+            return max(0.0, float(getattr(self.settings, "price_action_cooldown_minutes", 0.0)))
+        if key in {"news", "post_news"}:
+            return max(0.0, float(getattr(self.settings, "post_news_cooldown_minutes", 0.0)))
+        return 0.0
+
+    def _is_strategy_execution_allowed(self, strategy_name: str, now: datetime | None = None) -> bool:
+        cooldown_minutes = self._cooldown_minutes_for_strategy(strategy_name)
+        if cooldown_minutes <= 0:
+            return True
+        key = str(strategy_name).strip().lower()
+        last_execution = self._strategy_cooldowns.get(key)
+        if last_execution is None:
+            return True
+        current_time = now or datetime.now(timezone.utc)
+        return current_time - last_execution >= timedelta(minutes=cooldown_minutes)
+
+    def _mark_strategy_executed(self, strategy_name: str, now: datetime | None = None) -> None:
+        cooldown_minutes = self._cooldown_minutes_for_strategy(strategy_name)
+        if cooldown_minutes <= 0:
+            return
+        key = str(strategy_name).strip().lower()
+        self._strategy_cooldowns[key] = now or datetime.now(timezone.utc)
 
     def _count_open_positions_by_strategy(self, open_positions: list[dict[str, Any]]) -> dict[str, int]:
         counts: dict[str, int] = defaultdict(int)
@@ -727,17 +767,36 @@ class GoldLiveService:
         self._last_positions = positions
         logger.info("📌 Position monitor | symbol=%s open_positions=%s", symbol, len(positions))
         now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
-        existing_positions = {
+        existing_rows = [
+            row for row in self.position_store.list_positions(status="open") if row.get("position_key")
+        ]
+        existing_positions_by_key = {
             str(row.get("position_key", "")): row
-            for row in self.position_store.list_positions(status="open")
-            if row.get("position_key")
+            for row in existing_rows
+        }
+        existing_positions_by_ticket = {
+            (str(row.get("ticket") or ""), str(row.get("symbol") or "")): row
+            for row in existing_rows
+        }
+        existing_positions_by_comment = {
+            str(row.get("comment") or ""): row
+            for row in existing_rows
+            if str(row.get("comment") or "")
         }
         for item in positions:
             position_key = f"ctrader:ticket-{item['ticket']}:{item['symbol']}"
             direction = "buy" if int(item.get("type", 0)) == 0 else "sell"
-            existing = existing_positions.get(position_key, {})
+            comment = str(item.get("comment") or "")
+            existing = existing_positions_by_key.get(position_key, {})
+            if not existing:
+                existing = existing_positions_by_ticket.get((str(item.get("ticket") or ""), str(item.get("symbol") or "")), {})
+            if not existing and comment:
+                existing = existing_positions_by_comment.get(comment, {})
+            if existing and str(existing.get("position_key") or "") != position_key:
+                self.position_store.delete_position(str(existing.get("position_key") or ""))
             strategy = str(existing.get("strategy") or "external")
             timeframes = str(existing.get("timeframes") or "")
+            opened_at = str(existing.get("opened_at") or now_iso)
             self.position_store.upsert_position(
                 {
                     "position_key": position_key,
@@ -750,27 +809,40 @@ class GoldLiveService:
                     "take_profit": item["tp"],
                     "strategy": strategy,
                     "timeframes": timeframes,
+                    "comment": comment or str(existing.get("comment") or ""),
                     "source": "ctrader",
                     "is_external": 1,
                     "status": "open",
-                    "opened_at": now_iso,
+                    "opened_at": opened_at,
                 }
             )
-        position_rows = [
-            {
-                "ticket": int(item.get("ticket", 0)),
-                "symbol": str(item.get("symbol", "")),
-                "strategy": str(item.get("strategy", "") or "external"),
-                "timeframes": str(item.get("timeframes", "") or ""),
-                "direction": "buy" if int(item.get("type", 0)) == 0 else "sell",
-                "volume": float(item.get("volume", 0.0)),
-                "entry": float(item.get("price_open", 0.0)),
-                "sl": float(item.get("sl", 0.0)),
-                "tp": float(item.get("tp", 0.0)),
-                "profit": float(item.get("profit", 0.0)),
-            }
-            for item in positions
-        ]
+        position_rows = []
+        for item in positions:
+            ticket = str(item.get("ticket") or "")
+            symbol = str(item.get("symbol") or "")
+            position_key = f"ctrader:ticket-{ticket}:{symbol}"
+            existing = existing_positions_by_key.get(position_key, {})
+            if not existing:
+                existing = existing_positions_by_ticket.get((ticket, symbol), {})
+            if not existing:
+                comment = str(item.get("comment") or "")
+                existing = existing_positions_by_comment.get(comment, {}) if comment else {}
+            strategy = str(existing.get("strategy") or "external")
+            timeframes = str(existing.get("timeframes") or "")
+            position_rows.append(
+                {
+                    "ticket": int(item.get("ticket", 0)),
+                    "symbol": symbol,
+                    "strategy": strategy,
+                    "timeframes": timeframes,
+                    "direction": "buy" if int(item.get("type", 0)) == 0 else "sell",
+                    "volume": float(item.get("volume", 0.0)),
+                    "entry": float(item.get("price_open", 0.0)),
+                    "sl": float(item.get("sl", 0.0)),
+                    "tp": float(item.get("tp", 0.0)),
+                    "profit": float(item.get("profit", 0.0)),
+                }
+            )
         if not position_rows:
             position_rows = [{"ticket": "-", "symbol": "-", "strategy": "-", "timeframes": "-", "direction": "-", "volume": 0.0, "entry": 0.0, "sl": 0.0, "tp": 0.0, "profit": 0.0}]
         logger.info("📋 Open positions table:\n%s", self._format_table(position_rows, ["ticket", "symbol", "strategy", "timeframes", "direction", "volume", "entry", "sl", "tp", "profit"]))

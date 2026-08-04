@@ -7,6 +7,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from twisted.internet.task import LoopingCall
+
 from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthReq,
@@ -83,6 +85,9 @@ class GoldCTraderConnector:
         self._active_host_name = "live"
         self._active_host = EndPoints.PROTOBUF_LIVE_HOST
         self._active_port = EndPoints.PROTOBUF_PORT
+        self._last_activity_at: float | None = None
+        self._heartbeat_loop: LoopingCall | None = None
+        self._reconnect_timer: Any | None = None
 
     def connect(self) -> bool:
         if self._connected:
@@ -151,6 +156,8 @@ class GoldCTraderConnector:
                 continue
 
             self._connected = True
+            self._last_activity_at = time.monotonic()
+            self._start_heartbeat_loop()
             logger.info(
                 "cTrader connected | mode=%s endpoint=%s:%s account_id=%s",
                 host_name,
@@ -180,12 +187,15 @@ class GoldCTraderConnector:
             except Exception:
                 pass
 
+        self._stop_heartbeat_loop()
+        self._cancel_reconnect_timer()
         self._client = None
         self._connected = False
         self._account_id = None
         self._subscribed_symbol_ids.clear()
         self._spot_by_symbol_id.clear()
         self._socket_connected_event.clear()
+        self._last_activity_at = None
 
     def account_info(self) -> dict[str, Any] | None:
         if not self._connected or self._account_id is None:
@@ -716,6 +726,7 @@ class GoldCTraderConnector:
         return [value]
 
     def _on_message_received(self, _client: Client, message: Any) -> None:
+        self._mark_activity()
         payload = Protobuf.extract(message)
         if isinstance(payload, ProtoOASpotEvent):
             symbol_id = int(getattr(payload, "symbolId", 0) or 0)
@@ -740,6 +751,8 @@ class GoldCTraderConnector:
             self._active_port,
         )
         self._socket_connected_event.set()
+        self._mark_activity()
+        self._start_heartbeat_loop()
 
     def _on_socket_disconnected(self, _client: Client, _reason: Any) -> None:
         logger.info(
@@ -749,11 +762,16 @@ class GoldCTraderConnector:
             self._active_port,
         )
         self._socket_connected_event.clear()
+        self._stop_heartbeat_loop()
+        self._cancel_reconnect_timer()
+        self._mark_activity()
+        self._schedule_reconnect(delay=0.0)
 
     def _send_and_extract(self, request: Any, timeout: float | None = None) -> Any:
         if self._client is None:
             raise RuntimeError("cTrader client is not initialized")
 
+        self._mark_activity()
         wait_timeout = float(timeout if timeout is not None else getattr(self.settings, "ctrader_request_timeout_seconds", 12.0))
         event = threading.Event()
         state: dict[str, Any] = {"value": None, "error": None}
@@ -790,6 +808,68 @@ class GoldCTraderConnector:
         if value is None:
             raise RuntimeError("cTrader API call returned empty response")
         return value
+
+    def _mark_activity(self) -> None:
+        self._last_activity_at = time.monotonic()
+
+    def _start_heartbeat_loop(self) -> None:
+        if self._heartbeat_loop is not None and self._heartbeat_loop.running:
+            return
+        interval = max(0.1, float(getattr(self.settings, "ctrader_heartbeat_interval_seconds", 15.0)))
+        self._heartbeat_loop = LoopingCall(self._heartbeat_tick)
+        self._heartbeat_loop.start(interval, now=False)
+
+    def _stop_heartbeat_loop(self) -> None:
+        if self._heartbeat_loop is not None and self._heartbeat_loop.running:
+            self._heartbeat_loop.stop()
+        self._heartbeat_loop = None
+
+    def _heartbeat_tick(self) -> None:
+        if not self._connected or self._client is None:
+            self._stop_heartbeat_loop()
+            return
+
+        timeout_seconds = max(0.1, float(getattr(self.settings, "ctrader_heartbeat_timeout_seconds", 30.0)))
+        if self._last_activity_at is not None and (time.monotonic() - self._last_activity_at) >= timeout_seconds:
+            logger.warning("cTrader socket appears stale; forcing reconnect | timeout_seconds=%s", timeout_seconds)
+            self._handle_stale_connection()
+            return
+
+        if not getattr(self._client, "isConnected", False) or not self._socket_connected_event.is_set():
+            logger.warning("cTrader socket is not marked connected; forcing reconnect")
+            self._handle_stale_connection()
+            return
+
+        self._mark_activity()
+
+    def _handle_stale_connection(self) -> None:
+        if not self._connected:
+            return
+        self._cancel_reconnect_timer()
+        self._stop_heartbeat_loop()
+        self._socket_connected_event.clear()
+        self._connected = False
+        self.disconnect()
+        self._schedule_reconnect(delay=0.0)
+
+    def _schedule_reconnect(self, delay: float | None = None) -> None:
+        if self._reconnect_timer is not None and self._reconnect_timer.active():
+            return
+        reconnect_delay = 0.0 if delay is None else float(delay)
+        self._reconnect_timer = reactor.callLater(reconnect_delay, self._reconnect)
+
+    def _cancel_reconnect_timer(self) -> None:
+        if self._reconnect_timer is not None:
+            try:
+                self._reconnect_timer.cancel()
+            except Exception:
+                pass
+            self._reconnect_timer = None
+
+    def _reconnect(self) -> None:
+        self._cancel_reconnect_timer()
+        logger.info("Reconnecting cTrader session after socket disruption")
+        self.connect()
 
     def _call_in_reactor(self, fn: Any, timeout: float) -> Any:
         done = threading.Event()

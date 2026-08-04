@@ -29,6 +29,8 @@ class GoldSettings:
     ctrader_connect_timeout_seconds: float
     ctrader_reconnect_attempts: int
     ctrader_reconnect_wait_seconds: float
+    ctrader_heartbeat_interval_seconds: float
+    ctrader_heartbeat_timeout_seconds: float
     enable_trading: bool
     plot_enabled: bool
     symbols: list[str]
@@ -84,6 +86,8 @@ class GoldSettings:
     trade_magic_number: int
     trade_comment_prefix: str
     pip_size: float
+    price_action_cooldown_minutes: float
+    post_news_cooldown_minutes: float
     position_db_path: str
     config_env_path: str
 
@@ -208,6 +212,8 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
         ctrader_connect_timeout_seconds=max(3.0, _float_env("CTRADER_CONNECT_TIMEOUT_SECONDS", 15.0)),
         ctrader_reconnect_attempts=max(1, _int_env("CTRADER_RECONNECT_ATTEMPTS", 5)),
         ctrader_reconnect_wait_seconds=max(0.0, _float_env("CTRADER_RECONNECT_WAIT_SECONDS", 30.0)),
+        ctrader_heartbeat_interval_seconds=max(0.1, _float_env("CTRADER_HEARTBEAT_INTERVAL_SECONDS", 15.0)),
+        ctrader_heartbeat_timeout_seconds=max(0.1, _float_env("CTRADER_HEARTBEAT_TIMEOUT_SECONDS", 30.0)),
         enable_trading=_bool_env(os.getenv("ENABLE_TRADING"), default=True),
         plot_enabled=_bool_env(os.getenv("PLOT_ENABLED"), default=True),
         symbols=[s.strip().upper() for s in os.getenv("SYMBOLS", "XAUUSD").split(",") if s.strip()],
@@ -266,6 +272,8 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
         trade_magic_number=_int_env("GOLD_TRADE_MAGIC_NUMBER", 550015),
         trade_comment_prefix=os.getenv("GOLD_TRADE_COMMENT_PREFIX", "gold-bot"),
         pip_size=max(0.00001, _float_env("GOLD_PIP_SIZE", 0.01)),
+        price_action_cooldown_minutes=max(0.0, _float_env("PRICE_ACTION_COOLDOWN_MINUTES", 0.0)),
+        post_news_cooldown_minutes=max(0.0, _float_env("POST_NEWS_COOLDOWN_MINUTES", 0.0)),
         position_db_path=os.getenv("CTRADER_POSITION_DB_PATH", os.getenv("MT5_POSITION_DB_PATH", "logs/gold_positions.sqlite3")),
         config_env_path=str(resolved_env_path),
     )

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pandas as pd
 
 import bot.src.infrastructure.ctrader.connector as ctrader_connector_module
 
@@ -91,6 +94,33 @@ def test_connector_retries_initial_connect_on_transient_failure(monkeypatch) -> 
     assert connector.connect() is True
     assert attempts["count"] == 2
     assert connector._connected is True
+
+
+def test_connector_marks_stale_socket_for_reconnect(monkeypatch) -> None:
+    settings = SimpleNamespace(
+        ctrader_client_id="id",
+        ctrader_client_secret="secret",
+        ctrader_access_token="token",
+        ctrader_refresh_token="refresh",
+        ctrader_account_id=123,
+        ctrader_host="demo",
+        ctrader_request_timeout_seconds=3.0,
+        ctrader_connect_timeout_seconds=3.0,
+        ctrader_reconnect_attempts=1,
+        ctrader_reconnect_wait_seconds=0.0,
+        ctrader_heartbeat_interval_seconds=0.1,
+        ctrader_heartbeat_timeout_seconds=0.1,
+    )
+    connector = GoldCTraderConnector(settings)
+    connector._connected = True
+    connector._last_activity_at = time.monotonic() - 1.0
+    reconnect_calls: list[float | None] = []
+
+    monkeypatch.setattr(connector, "_schedule_reconnect", lambda delay=None: reconnect_calls.append(delay))
+
+    connector._handle_stale_connection()
+
+    assert reconnect_calls == [0.0]
 
 
 def test_position_store_persists_and_closes_positions(tmp_path: Path) -> None:
@@ -209,6 +239,100 @@ def test_connector_resolves_gold_alias_with_suffix() -> None:
     assert connector.resolve_symbol("GOLD") == "XAUUSD.A"
 
 
+def test_monitor_reuses_local_position_metadata_by_comment(tmp_path: Path) -> None:
+    settings = SimpleNamespace(
+        strategy_names=["trend_following"],
+        trade_comment_prefix="gold-bot",
+        trade_magic_number=550015,
+        ladder_entries=2,
+        enable_multi_entry=True,
+        max_daily_trades=10,
+        enable_trading=True,
+        fixed_lot_size=0.01,
+        stop_loss_pips=100.0,
+        take_profit_pips=140.0,
+        ladder_step_ratio=1.0,
+        pip_size=0.01,
+        lower_timeframe="M5",
+        higher_timeframe="M30",
+        poll_seconds=0.2,
+        position_monitor_seconds=10.0,
+        account_monitor_seconds=10.0,
+        chart_update_seconds=10.0,
+        plot_enabled=False,
+        plot_ltf_candles=120,
+        plot_htf_candles=90,
+        candle_count=100,
+        max_cycles=0,
+        strategy_presets={},
+        config_env_path="bot/.env",
+        ema_fast=12,
+        ema_slow=26,
+        ema_trend_period=50,
+    )
+    runner = GoldRunner(settings)
+    position_store = GoldPositionStore(tmp_path / "positions.sqlite3")
+
+    class FakeConnector:
+        def open_positions(self, symbol: str | None = None) -> list[dict[str, object]]:
+            return [
+                {
+                    "ticket": 39820336,
+                    "symbol": "XAUUSD",
+                    "type": 0,
+                    "volume": 1.0,
+                    "price_open": 4060.98,
+                    "sl": 4054.93,
+                    "tp": 4096.93,
+                    "profit": 9.78,
+                    "comment": "gold-bot:trend_following:L1",
+                }
+            ]
+
+    service = GoldLiveService(
+        settings=settings,
+        runner=runner,
+        connector=FakeConnector(),
+        position_store=position_store,
+        chart_renderer=LiveChartRenderer(
+            output_dir=tmp_path,
+            interactive=False,
+            chart_width=14.0,
+            chart_height=8.0,
+            max_lower_candles=120,
+            max_higher_candles=90,
+        ),
+    )
+
+    position_store.upsert_position(
+        {
+            "position_key": "ctrader:ticket-999:XAUUSD",
+            "ticket": 999,
+            "symbol": "XAUUSD",
+            "direction": "buy",
+            "volume": 0.2,
+            "entry_price": 4063.42,
+            "stop_loss": 4062.58,
+            "take_profit": 4064.98,
+            "strategy": "trend_following",
+            "timeframes": "M5/M30",
+            "comment": "gold-bot:trend_following:L1",
+            "source": "ctrader",
+            "is_external": 1,
+            "status": "open",
+            "opened_at": "2026-08-04T09:00:00",
+        }
+    )
+
+    service._monitor_positions("XAUUSD")
+
+    stored = position_store.list_positions(status="open")
+    assert len(stored) == 1
+    assert stored[0]["ticket"] == 39820336
+    assert stored[0]["strategy"] == "trend_following"
+    assert stored[0]["timeframes"] == "M5/M30"
+
+
 def test_monitor_preserves_strategy_and_timeframes_for_open_positions(tmp_path: Path) -> None:
     settings = SimpleNamespace(
         strategy_names=["trend_following"],
@@ -296,6 +420,87 @@ def test_monitor_preserves_strategy_and_timeframes_for_open_positions(tmp_path: 
     assert len(stored) == 1
     assert stored[0]["strategy"] == "trend_following"
     assert stored[0]["timeframes"] == "M5/M30"
+
+
+def test_price_action_cooldown_blocks_repeated_signals(tmp_path: Path) -> None:
+    settings = SimpleNamespace(
+        strategy_names=["price_action"],
+        trade_comment_prefix="gold-bot",
+        trade_magic_number=550015,
+        ladder_entries=1,
+        enable_multi_entry=False,
+        max_daily_trades=10,
+        enable_trading=True,
+        fixed_lot_size=0.01,
+        stop_loss_pips=100.0,
+        take_profit_pips=140.0,
+        ladder_step_ratio=1.0,
+        pip_size=0.01,
+        lower_timeframe="M5",
+        higher_timeframe="M30",
+        poll_seconds=0.2,
+        position_monitor_seconds=10.0,
+        account_monitor_seconds=10.0,
+        chart_update_seconds=10.0,
+        plot_enabled=False,
+        plot_ltf_candles=120,
+        plot_htf_candles=90,
+        candle_count=100,
+        max_cycles=0,
+        strategy_presets={},
+        config_env_path="bot/.env",
+        ema_fast=12,
+        ema_slow=26,
+        ema_trend_period=50,
+        price_action_cooldown_minutes=60.0,
+        post_news_cooldown_minutes=60.0,
+    )
+    runner = GoldRunner(settings)
+    position_store = GoldPositionStore(tmp_path / "positions.sqlite3")
+    orders = []
+
+    class FakeConnector:
+        def open_positions(self, symbol: str | None = None) -> list[dict[str, object]]:
+            return []
+
+        def account_info(self) -> dict[str, object]:
+            return {"balance": 1000.0, "equity": 1000.0}
+
+        def symbol_info(self, symbol: str) -> dict[str, object]:
+            return {"symbol": symbol}
+
+        def current_price(self, symbol: str, direction: str) -> float:
+            return 4000.0
+
+        def place_market_order(self, **kwargs) -> dict[str, object]:
+            orders.append(kwargs)
+            return {"ok": True, "order": 1, "price": 4000.0, "filling": "filled"}
+
+    service = GoldLiveService(
+        settings=settings,
+        runner=runner,
+        connector=FakeConnector(),
+        position_store=position_store,
+        chart_renderer=LiveChartRenderer(
+            output_dir=tmp_path,
+            interactive=False,
+            chart_width=14.0,
+            chart_height=8.0,
+            max_lower_candles=120,
+            max_higher_candles=90,
+        ),
+    )
+
+    candidate = SimpleNamespace(strategy="price_action", direction="buy", reason="breakout", price=4000.0)
+    first_lower = pd.DataFrame({"datetime": [pd.Timestamp("2026-08-04T12:00:00")], "open": [4000.0], "high": [4001.0], "low": [3999.0], "close": [4000.0]})
+    first_higher = pd.DataFrame({"datetime": [pd.Timestamp("2026-08-04T11:45:00")], "open": [4000.0], "high": [4001.0], "low": [3999.0], "close": [4000.0]})
+    second_lower = pd.DataFrame({"datetime": [pd.Timestamp("2026-08-04T12:01:00")], "open": [4001.0], "high": [4002.0], "low": [4000.0], "close": [4001.0]})
+    second_higher = pd.DataFrame({"datetime": [pd.Timestamp("2026-08-04T11:46:00")], "open": [4001.0], "high": [4002.0], "low": [4000.0], "close": [4001.0]})
+
+    service._handle_candidate("XAUUSD", candidate, first_lower, first_higher, "M5", "M30", 100.0, 140.0)
+    service._handle_candidate("XAUUSD", candidate, second_lower, second_higher, "M5", "M30", 100.0, 140.0)
+
+    assert len(orders) == 1
 
 
 def test_live_service_requires_ctrader_connection(tmp_path: Path) -> None:
