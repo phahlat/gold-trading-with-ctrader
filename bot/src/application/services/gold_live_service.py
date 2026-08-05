@@ -137,8 +137,14 @@ class GoldLiveService:
                             pair_index = int(pair_config.get("pair_index", 0))
                             lower_tf = str(pair_config["lower_timeframe"])
                             higher_tf = str(pair_config["higher_timeframe"])
-                            lower_frame = frames_by_timeframe.get(lower_tf, pd.DataFrame())
-                            higher_frame = frames_by_timeframe.get(higher_tf, pd.DataFrame())
+                            lower_frame = self._closed_candle_frame(
+                                frames_by_timeframe.get(lower_tf, pd.DataFrame()),
+                                lower_tf,
+                            )
+                            higher_frame = self._closed_candle_frame(
+                                frames_by_timeframe.get(higher_tf, pd.DataFrame()),
+                                higher_tf,
+                            )
                             if lower_frame.empty or higher_frame.empty:
                                 self._log_strategy_eval(
                                     "🧪 Strategy evaluation result | status=failed symbol=%s strategy=%s pair_index=%s ltf=%s htf=%s reason=missing_frame",
@@ -338,7 +344,49 @@ class GoldLiveService:
         dropped = int((~valid).sum())
         if dropped > 0:
             logger.warning("Filtered %s malformed %s bars for %s", dropped, timeframe, symbol)
-        return frame.loc[valid].reset_index(drop=True)
+        sanitized = frame.loc[valid].reset_index(drop=True)
+        return self._closed_candle_frame(sanitized, timeframe)
+
+    def _closed_candle_frame(self, frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        if frame.empty or "datetime" not in frame.columns:
+            return frame
+        if len(frame) < 2:
+            return frame
+
+        timeframe_delta = self._timeframe_delta(timeframe)
+        if timeframe_delta is None:
+            # Unknown timeframe format, keep conservative behavior by dropping latest bar.
+            return frame.iloc[:-1].reset_index(drop=True)
+
+        last_ts = pd.to_datetime(frame.iloc[-1]["datetime"], errors="coerce")
+        if pd.isna(last_ts):
+            return frame.iloc[:-1].reset_index(drop=True)
+
+        now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        if last_ts + timeframe_delta > now_utc_naive:
+            return frame.iloc[:-1].reset_index(drop=True)
+        return frame.reset_index(drop=True)
+
+    def _timeframe_delta(self, timeframe: str) -> timedelta | None:
+        value = str(timeframe or "").strip().upper()
+        if len(value) < 2:
+            return None
+        unit = value[0]
+        amount_text = value[1:]
+        if not amount_text.isdigit():
+            return None
+        amount = int(amount_text)
+        if amount <= 0:
+            return None
+        if unit == "M":
+            return timedelta(minutes=amount)
+        if unit == "H":
+            return timedelta(hours=amount)
+        if unit == "D":
+            return timedelta(days=amount)
+        if unit == "W":
+            return timedelta(weeks=amount)
+        return None
 
     def _is_connection_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
