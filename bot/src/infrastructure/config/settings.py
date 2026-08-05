@@ -9,10 +9,41 @@ from dotenv import load_dotenv
 
 @dataclass(frozen=True)
 class StrategyPreset:
-    lower_timeframe: str
-    higher_timeframe: str
-    stop_loss_pips: float
-    take_profit_pips: float
+    lower_timeframes: list[str]
+    higher_timeframes: list[str]
+    stop_loss_pips_list: list[float]
+    take_profit_pips_list: list[float]
+
+    @property
+    def lower_timeframe(self) -> str:
+        return self.lower_timeframes[0]
+
+    @property
+    def higher_timeframe(self) -> str:
+        return self.higher_timeframes[0]
+
+    @property
+    def stop_loss_pips(self) -> float:
+        return self.stop_loss_pips_list[0]
+
+    @property
+    def take_profit_pips(self) -> float:
+        return self.take_profit_pips_list[0]
+
+    def pair_configs(self) -> list[dict[str, float | str | int]]:
+        pairs: list[dict[str, float | str | int]] = []
+        pair_count = len(self.lower_timeframes)
+        for index in range(pair_count):
+            pairs.append(
+                {
+                    "pair_index": index,
+                    "lower_timeframe": self.lower_timeframes[index],
+                    "higher_timeframe": self.higher_timeframes[index],
+                    "stop_loss_pips": float(self.stop_loss_pips_list[index]),
+                    "take_profit_pips": float(self.take_profit_pips_list[index]),
+                }
+            )
+        return pairs
 
 
 @dataclass(frozen=True)
@@ -53,6 +84,7 @@ class GoldSettings:
     plot_htf_candles: int
     max_cycles: int
     log_level: str
+    strategy_eval_log_verbose: bool
     backtest_data_dir: str
     backtest_initial_balance: float
     backtest_fixed_volume: float
@@ -87,7 +119,6 @@ class GoldSettings:
     trade_comment_prefix: str
     pip_size: float
     price_action_cooldown_minutes: float
-    post_news_cooldown_minutes: float
     position_db_path: str
     config_env_path: str
 
@@ -171,11 +202,51 @@ def _strategy_preset_env(
     default_stop_loss_pips: float,
     default_take_profit_pips: float,
 ) -> StrategyPreset:
+    def _list_env(raw_value: str | None, default_value: str) -> list[str]:
+        source = raw_value if raw_value is not None and raw_value.strip() else default_value
+        items = [item.strip().upper() for item in source.split(",") if item.strip()]
+        return items or [default_value.strip().upper()]
+
+    def _float_list_env(raw_value: str | None, default_value: float) -> list[float]:
+        source = raw_value if raw_value is not None and raw_value.strip() else str(default_value)
+        values: list[float] = []
+        for token in source.split(","):
+            cleaned = token.strip()
+            if not cleaned:
+                continue
+            values.append(max(1.0, float(cleaned)))
+        return values or [max(1.0, float(default_value))]
+
+    lower_timeframes = _list_env(os.getenv(f"{prefix}_LTF"), default_ltf)
+    higher_timeframes = _list_env(os.getenv(f"{prefix}_HTF"), default_htf)
+    if len(lower_timeframes) != len(higher_timeframes):
+        raise ValueError(
+            f"Invalid {prefix} timeframe lists: {prefix}_LTF has {len(lower_timeframes)} item(s) but {prefix}_HTF has {len(higher_timeframes)} item(s)."
+        )
+
+    stop_loss_values = _float_list_env(os.getenv(f"{prefix}_GOLD_STOP_LOSS_PIPS"), default_stop_loss_pips)
+    take_profit_values = _float_list_env(os.getenv(f"{prefix}_GOLD_TAKE_PROFIT_PIPS"), default_take_profit_pips)
+    pair_count = len(lower_timeframes)
+
+    if len(stop_loss_values) == 1:
+        stop_loss_values = [stop_loss_values[0] for _ in range(pair_count)]
+    elif len(stop_loss_values) != pair_count:
+        raise ValueError(
+            f"Invalid {prefix}_GOLD_STOP_LOSS_PIPS list: expected 1 or {pair_count} item(s), got {len(stop_loss_values)}."
+        )
+
+    if len(take_profit_values) == 1:
+        take_profit_values = [take_profit_values[0] for _ in range(pair_count)]
+    elif len(take_profit_values) != pair_count:
+        raise ValueError(
+            f"Invalid {prefix}_GOLD_TAKE_PROFIT_PIPS list: expected 1 or {pair_count} item(s), got {len(take_profit_values)}."
+        )
+
     return StrategyPreset(
-        lower_timeframe=os.getenv(f"{prefix}_LTF", default_ltf).strip().upper(),
-        higher_timeframe=os.getenv(f"{prefix}_HTF", default_htf).strip().upper(),
-        stop_loss_pips=max(1.0, _float_env(f"{prefix}_GOLD_STOP_LOSS_PIPS", default_stop_loss_pips)),
-        take_profit_pips=max(1.0, _float_env(f"{prefix}_GOLD_TAKE_PROFIT_PIPS", default_take_profit_pips)),
+        lower_timeframes=lower_timeframes,
+        higher_timeframes=higher_timeframes,
+        stop_loss_pips_list=stop_loss_values,
+        take_profit_pips_list=take_profit_values,
     )
 
 
@@ -189,14 +260,26 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
     load_dotenv(str(resolved_env_path), override=False)
     backtest_speed_ms = _required_backtest_speed_ms()
 
-    strategy_names = [s.strip().lower() for s in os.getenv("GOLD_STRATEGY_NAMES", "trend_following,price_action,scalping").split(",") if s.strip()]
+    raw_strategy_names = []
+    for item in os.getenv("GOLD_STRATEGY_NAMES", "trend_following,price_action,session_breakout").split(","):
+        cleaned = item.split("#", 1)[0].strip().lower()
+        if cleaned:
+            raw_strategy_names.append(cleaned)
     strategy_presets: dict[str, StrategyPreset] = {
         "trend_following": _strategy_preset_env("TREND_FOLLOWING", "M15", "H1", 120.0, 250.0),
         "price_action": _strategy_preset_env("PRICE_ACTION", "M5", "M30", 80.0, 180.0),
-        "scalping": _strategy_preset_env("SCALPING", "M5", "M30", 40.0, 90.0),
-        "news": _strategy_preset_env("NEWS", "M5", "M30", 60.0, 140.0),
         "session_breakout": _strategy_preset_env("SESSION_BREAKOUT", "M15", "H1", 100.0, 220.0),
     }
+    unsupported = [name for name in raw_strategy_names if name not in strategy_presets]
+    if unsupported:
+        raise ValueError(
+            "Unsupported GOLD_STRATEGY_NAMES value(s): "
+            + ",".join(unsupported)
+            + ". Supported: trend_following,price_action,session_breakout"
+        )
+    strategy_names = [name for name in raw_strategy_names if name in strategy_presets]
+    if not strategy_names:
+        strategy_names = ["trend_following"]
     primary_strategy = strategy_names[0] if strategy_names and strategy_names[0] in strategy_presets else "trend_following"
     primary_preset = strategy_presets[primary_strategy]
     return GoldSettings(
@@ -236,6 +319,7 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
         plot_htf_candles=max(1, _required_int_env("PLOT_HTF_CANDLES")),
         max_cycles=_int_env("MAX_CYCLES", 0),
         log_level=os.getenv("LOG_LEVEL", "DEBUG").strip().upper(),
+        strategy_eval_log_verbose=_bool_env(os.getenv("STRATEGY_EVAL_LOG_VERBOSE"), default=True),
         backtest_data_dir=os.getenv("BACKTEST_DATA_DIR", "backtest/data"),
         backtest_initial_balance=_float_env("BACKTEST_INITIAL_BALANCE", 10000.0),
         backtest_fixed_volume=_float_env("BACKTEST_FIXED_VOLUME", 0.0),
@@ -273,7 +357,6 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
         trade_comment_prefix=os.getenv("GOLD_TRADE_COMMENT_PREFIX", "gold-bot"),
         pip_size=max(0.00001, _float_env("GOLD_PIP_SIZE", 0.01)),
         price_action_cooldown_minutes=max(0.0, _float_env("PRICE_ACTION_COOLDOWN_MINUTES", 0.0)),
-        post_news_cooldown_minutes=max(0.0, _float_env("POST_NEWS_COOLDOWN_MINUTES", 0.0)),
         position_db_path=os.getenv("CTRADER_POSITION_DB_PATH", os.getenv("MT5_POSITION_DB_PATH", "logs/gold_positions.sqlite3")),
         config_env_path=str(resolved_env_path),
     )

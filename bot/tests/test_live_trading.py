@@ -472,7 +472,6 @@ def test_price_action_cooldown_blocks_repeated_signals(tmp_path: Path) -> None:
         ema_slow=26,
         ema_trend_period=50,
         price_action_cooldown_minutes=60.0,
-        post_news_cooldown_minutes=60.0,
     )
     runner = GoldRunner(settings)
     position_store = GoldPositionStore(tmp_path / "positions.sqlite3")

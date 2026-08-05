@@ -30,22 +30,14 @@ cd /d c:\CodePlay\gold-trading-bot
 
 ```bat
 cd /d c:\CodePlay\gold-trading-bot
-.venv\Scripts\python.exe .\main.py --mode backtest --no-trade --symbols XAUUSD --strategy price_action --backtest-data-dir bot\backtest\data\XAUUSD15.csv --backtest-results-subdir price_action_backtest
+.venv\Scripts\python.exe .\main.py --mode backtest --no-trade --symbols XAUUSD --strategy price_action --backtest-data-dir bot\backtest\data --backtest-results-subdir price_action_backtest
 ```
 
-### Scalping backtest
+### Session-breakout backtest
 
 ```bat
 cd /d c:\CodePlay\gold-trading-bot
-.venv\Scripts\python.exe .\main.py --mode backtest --no-trade --symbols XAUUSD --strategy scalping --backtest-data-dir bot\backtest\data\XAUUSD15.csv --backtest-results-subdir scalping_backtest
-```
-
-### News and breakout backtests
-
-```bat
-cd /d c:\CodePlay\gold-trading-bot
-.venv\Scripts\python.exe .\main.py --mode backtest --no-trade --symbols XAUUSD --strategy news --backtest-data-dir bot\backtest\data\XAUUSD15.csv --backtest-results-subdir news_backtest
-.venv\Scripts\python.exe .\main.py --mode backtest --no-trade --symbols XAUUSD --strategy session_breakout --backtest-data-dir bot\backtest\data\XAUUSD15.csv --backtest-results-subdir breakout_backtest
+.venv\Scripts\python.exe .\main.py --mode backtest --no-trade --symbols XAUUSD --strategy session_breakout --backtest-data-dir bot\backtest\data --backtest-results-subdir breakout_backtest
 ```
 
 ## Live / Dry-Run Commands

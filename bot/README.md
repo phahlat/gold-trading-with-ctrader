@@ -12,8 +12,6 @@ The available strategies are documented in [docs/STRATEGIES.md](../docs/STRATEGI
 
 - `trend_following`: EMA trend + pullback breakout logic
 - `price_action`: structural rejection logic around recent highs/lows
-- `scalping`: fast EMA crossover logic
-- `news`: volatility spike / recovery logic
 - `session_breakout`: breakout above/below the recent session range
 
 ## Usage
@@ -21,7 +19,7 @@ The available strategies are documented in [docs/STRATEGIES.md](../docs/STRATEGI
 ```bat
 cd /d c:\Users\PHAHLA\Documents\GitHub\phahla-trading-bot\ema-bot
 copy gold_bot\.env.example gold_bot\.env
-.\.venv\Scripts\python.exe -m bot.src.interfaces.cli.main --env gold_bot\.env --backtest --data gold_bot\backtest\data\XAUUSD15.csv
+.\.venv\Scripts\python.exe -m bot.src.interfaces.cli.main --env gold_bot\.env --mode backtest --backtest-data-dir gold_bot\backtest\data\
 ```
 
 ## Configuration

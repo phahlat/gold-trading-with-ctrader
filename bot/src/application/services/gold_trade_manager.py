@@ -69,13 +69,6 @@ class GoldTradeManager:
     ) -> dict[str, Any]:
         stop_pips = float(stop_loss_pips) if stop_loss_pips is not None else float(self.settings.stop_loss_pips)
         take_pips = float(take_profit_pips) if take_profit_pips is not None else float(self.settings.take_profit_pips)
-        multiplier = self.settings.ladder_step_ratio ** (level - 1)
-        price = candidate.price
-        if candidate.direction == "buy":
-            price = price + (stop_pips * self.settings.pip_size) * multiplier
-        else:
-            price = price - (stop_pips * self.settings.pip_size) * multiplier
-
         tp_base = take_pips
         tp_increment = tp_base * self.settings.ladder_step_ratio
         take_profit_pips = tp_base + (tp_increment * (level - 1))
@@ -83,7 +76,7 @@ class GoldTradeManager:
             "strategy": candidate.strategy,
             "direction": candidate.direction,
             "reason": candidate.reason,
-            "entry_price": round(price, 5),
+            "entry_price": round(candidate.price, 5),
             "take_profit_pips": round(take_profit_pips, 2),
             "stop_loss_pips": round(stop_pips, 2),
             "level": level,

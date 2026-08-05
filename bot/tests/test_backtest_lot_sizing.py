@@ -18,6 +18,9 @@ class _NoopChart:
     def close(self) -> None:
         return None
 
+    def render_dual_timeframe(self, *args, **kwargs) -> None:  # pragma: no cover - defensive no-op
+        return None
+
 
 def _service(settings: SimpleNamespace) -> GoldBacktestService:
     return GoldBacktestService(settings=settings, runner=_NoopRunner(), chart_renderer=_NoopChart())
@@ -277,3 +280,105 @@ def test_build_order_request_falls_back_to_configured_pips_when_zero_is_passed()
 
     assert order["stop_loss"] == 4104.97
     assert order["take_profit"] == 4110.97
+
+
+def test_multi_timeframe_backtest_uses_strategy_specific_ltf_and_htf_frames() -> None:
+    calls: list[tuple[str, int, int]] = []
+
+    class RunnerStub:
+        def evaluate_candidates(self, frame, higher_frame=None, strategy_names=None):
+            strategy = (strategy_names or [""])[0]
+            calls.append((strategy, len(frame), len(higher_frame) if higher_frame is not None else 0))
+            return []
+
+    settings = SimpleNamespace(
+        strategy_names=["trend_following", "price_action", "session_breakout"],
+        strategy_presets={
+            "trend_following": SimpleNamespace(lower_timeframe="M30", higher_timeframe="H4", stop_loss_pips=120.0, take_profit_pips=250.0),
+            "price_action": SimpleNamespace(lower_timeframe="M5", higher_timeframe="M30", stop_loss_pips=80.0, take_profit_pips=180.0),
+            "session_breakout": SimpleNamespace(lower_timeframe="M15", higher_timeframe="H1", stop_loss_pips=100.0, take_profit_pips=220.0),
+        },
+        lower_timeframe="M15",
+        higher_timeframe="H1",
+        stop_loss_pips=100.0,
+        take_profit_pips=140.0,
+        ema_trend_period=20,
+        backtest_initial_balance=1000.0,
+        symbols=["XAUUSD"],
+        plot_ltf_candles=120,
+        plot_htf_candles=90,
+        plot_enabled=False,
+        refresh_candle_count=5,
+        enable_multi_entry=False,
+        ladder_entries=1,
+        ladder_step_ratio=1.0,
+        fixed_lot_size=0.01,
+        backtest_fixed_volume=0.01,
+        backtest_warn_volume_above=0.0,
+        backtest_warn_equity_multiplier=20.0,
+        backtest_use_broker_profile=False,
+        config_env_path="bot/.env",
+        pip_size=0.01,
+    )
+
+    service = GoldBacktestService(settings=settings, runner=RunnerStub(), chart_renderer=_NoopChart())
+
+    def _frame(datetimes: list[str], closes: list[float]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(datetimes),
+                "open": closes,
+                "high": [value + 1.0 for value in closes],
+                "low": [value - 1.0 for value in closes],
+                "close": closes,
+            }
+        )
+
+    frames_by_timeframe = {
+        "M5": _frame(
+            [
+                "2026-08-01 00:00:00",
+                "2026-08-01 00:05:00",
+                "2026-08-01 00:10:00",
+                "2026-08-01 00:15:00",
+                "2026-08-01 00:20:00",
+                "2026-08-01 00:25:00",
+            ],
+            [4000.0, 4001.0, 4002.0, 4003.0, 4004.0, 4005.0],
+        ),
+        "M15": _frame(
+            ["2026-08-01 00:00:00", "2026-08-01 00:15:00", "2026-08-01 00:30:00", "2026-08-01 00:45:00"],
+            [4010.0, 4011.0, 4012.0, 4013.0],
+        ),
+        "M30": _frame(
+            ["2026-08-01 00:00:00", "2026-08-01 00:30:00"],
+            [4020.0, 4021.0],
+        ),
+        "H1": _frame(
+            ["2026-08-01 00:00:00", "2026-08-01 01:00:00"],
+            [4030.0, 4031.0],
+        ),
+        "H4": _frame(
+            ["2026-08-01 00:00:00"],
+            [4040.0],
+        ),
+    }
+
+    result = service.run(
+        lower_frame=pd.DataFrame(),
+        higher_frame=pd.DataFrame(),
+        source_name="xauusd",
+        artifact_stem="multi_tf_dispatch",
+        frames_by_timeframe=frames_by_timeframe,
+        strategy_timeframe_paths={},
+    )
+
+    max_lens: dict[str, tuple[int, int]] = {}
+    for strategy, ltf_len, htf_len in calls:
+        prev_ltf, prev_htf = max_lens.get(strategy, (0, 0))
+        max_lens[strategy] = (max(prev_ltf, ltf_len), max(prev_htf, htf_len))
+
+    assert max_lens["trend_following"] == (2, 1)
+    assert max_lens["price_action"] == (6, 2)
+    assert max_lens["session_breakout"] == (4, 1)
+    assert result["processed_bars"] > 0

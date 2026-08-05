@@ -9,8 +9,6 @@ import pandas as pd
 class GoldStrategyName(str, Enum):
     TREND_FOLLOWING = "trend_following"
     PRICE_ACTION = "price_action"
-    SCALPING = "scalping"
-    NEWS = "news"
     SESSION_BREAKOUT = "session_breakout"
 
 
@@ -40,17 +38,10 @@ class GoldStrategyEngine:
         active_strategies = {name.strip().lower() for name in (strategy_names or self.strategy_names) if str(name).strip()}
 
         close = frame["close"].astype(float)
-        high = frame["high"].astype(float)
-        low = frame["low"].astype(float)
-
         if "trend_following" in active_strategies:
             candidates.extend(self._trend_following(close, frame, settings))
         if "price_action" in active_strategies:
             candidates.extend(self._price_action(close, frame))
-        if "scalping" in active_strategies:
-            candidates.extend(self._scalping(close, frame, settings))
-        if "news" in active_strategies:
-            candidates.extend(self._news(close, high, low, frame))
         if "session_breakout" in active_strategies:
             candidates.extend(self._session_breakout(close, frame))
 
@@ -129,34 +120,6 @@ class GoldStrategyEngine:
             return [SignalCandidate(strategy="price_action", direction="buy", reason="rejection at resistance", price=current)]
         if current < recent_low:
             return [SignalCandidate(strategy="price_action", direction="sell", reason="rejection at support", price=current)]
-        return []
-
-    def _scalping(self, close: pd.Series, frame: pd.DataFrame, settings: object) -> list[SignalCandidate]:
-        if len(close) < 3:
-            return []
-        fast_period = int(getattr(settings, "ema_fast", 9))
-        slow_period = int(getattr(settings, "ema_slow", 21))
-        ema_fast = close.ewm(span=fast_period, adjust=False).mean()
-        ema_slow = close.ewm(span=slow_period, adjust=False).mean()
-        last_fast = float(ema_fast.iloc[-1])
-        last_slow = float(ema_slow.iloc[-1])
-        prev_fast = float(ema_fast.iloc[-2])
-        prev_slow = float(ema_slow.iloc[-2])
-        if last_fast > last_slow and prev_fast <= prev_slow:
-            return [SignalCandidate(strategy="scalping", direction="buy", reason="EMA crossover", price=float(close.iloc[-1]))]
-        if last_fast < last_slow and prev_fast >= prev_slow:
-            return [SignalCandidate(strategy="scalping", direction="sell", reason="EMA crossover", price=float(close.iloc[-1]))]
-        return []
-
-    def _news(self, close: pd.Series, high: pd.Series, low: pd.Series, frame: pd.DataFrame) -> list[SignalCandidate]:
-        if len(close) < 3:
-            return []
-        current = float(close.iloc[-1])
-        prev = float(close.iloc[-2])
-        if current > prev and high.iloc[-1] > high.iloc[-2]:
-            return [SignalCandidate(strategy="news", direction="buy", reason="fade recovery after spike", price=current)]
-        if current < prev and low.iloc[-1] < low.iloc[-2]:
-            return [SignalCandidate(strategy="news", direction="sell", reason="fade recovery after spike", price=current)]
         return []
 
     def _session_breakout(self, close: pd.Series, frame: pd.DataFrame) -> list[SignalCandidate]:

@@ -43,7 +43,7 @@ class LiveChartRenderer:
         self._max_lower_candles = max_lower_candles
         self._max_higher_candles = max_higher_candles
         normalized_strategies = {name.strip().lower() for name in (strategy_names or []) if str(name).strip()}
-        self._show_ema_overlay = bool(normalized_strategies.intersection({"trend_following", "scalping"}))
+        self._show_ema_overlay = bool(normalized_strategies.intersection({"trend_following"}))
         self._ema_fast = max(1, int(ema_fast))
         self._ema_slow = max(1, int(ema_slow))
         self._ema_trend_period = max(1, int(ema_trend_period))

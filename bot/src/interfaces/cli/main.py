@@ -15,7 +15,7 @@ from bot.src.infrastructure.charting.live_plot import LiveChartRenderer
 from bot.src.infrastructure.config.settings import load_gold_settings
 from bot.src.infrastructure.ctrader.connector import GoldCTraderConnector
 from bot.src.infrastructure.logging.runtime import GoldQueueLoggingManager
-from bot.src.infrastructure.market_data.csv_loader import load_backtest_ltf_htf_frames
+from bot.src.infrastructure.market_data.csv_loader import load_ohlc_frame, resolve_backtest_timeframe_file
 from bot.src.infrastructure.persistence.sqlite_store import GoldPositionStore
 
 logger = logging.getLogger(__name__)
@@ -42,30 +42,34 @@ def _resolve_backtest_data_source(args: object, settings: object) -> str:
     def _normalize(value: str | Path) -> str:
         return str(Path(value)).replace("\\", "/")
 
+    def _as_directory(value: str | Path) -> Path:
+        path = Path(value)
+        return path.parent if path.exists() and path.is_file() else path
+
     def _prefer_existing(candidate: str | Path) -> str | None:
-        path = Path(candidate)
+        path = _as_directory(candidate)
         if path.exists():
             return _normalize(path)
         return None
 
     cli_backtest_dir = getattr(args, "backtest_data_dir", None)
     if cli_backtest_dir:
-        return _normalize(cli_backtest_dir)
+        return _normalize(_as_directory(cli_backtest_dir))
 
     cli_data = getattr(args, "data", None)
     if cli_data and cli_data != "backtest/data":
-        return _normalize(cli_data)
+        return _normalize(_as_directory(cli_data))
 
     configured = getattr(settings, "backtest_data_dir", None)
     if configured:
-        candidate = Path(configured)
+        candidate = _as_directory(configured)
         if candidate.exists():
             return _normalize(candidate)
 
     for bundled in [
-        Path("bot/backtest/data/XAUUSD15.csv"),
-        Path("gold_bot/backtest/data/XAUUSD15.csv"),
-        Path("backtest/data/XAUUSD15.csv"),
+        Path("bot/backtest/data"),
+        Path("gold_bot/backtest/data"),
+        Path("backtest/data"),
     ]:
         resolved = _prefer_existing(bundled)
         if resolved is not None:
@@ -172,14 +176,44 @@ def main() -> int:
     if args.mode == "backtest":
         data_source = _resolve_backtest_data_source(args, settings)
         data_path = Path(data_source)
+
+        strategy_names = [name.strip().lower() for name in settings.strategy_names if str(name).strip()]
+        if not strategy_names:
+            strategy_names = ["trend_following"]
+
+        symbol = settings.symbols[0] if settings.symbols else "XAUUSD"
+        strategy_pairs: dict[str, list[dict[str, object]]] = {}
+        for strategy_name in strategy_names:
+            preset = settings.strategy_presets.get(strategy_name)
+            if preset is None:
+                strategy_pairs[strategy_name] = [
+                    {
+                        "lower_timeframe": str(settings.lower_timeframe).upper(),
+                        "higher_timeframe": str(settings.higher_timeframe).upper(),
+                    }
+                ]
+            else:
+                strategy_pairs[strategy_name] = [
+                    {
+                        "lower_timeframe": str(pair["lower_timeframe"]).upper(),
+                        "higher_timeframe": str(pair["higher_timeframe"]).upper(),
+                    }
+                    for pair in preset.pair_configs()
+                ]
+
+        frames_by_timeframe: dict[str, object] = {}
+        timeframe_paths: dict[str, Path] = {}
         try:
-            symbol = settings.symbols[0] if settings.symbols else "XAUUSD"
-            lower_frame, higher_frame, lower_path, higher_path = load_backtest_ltf_htf_frames(
-                data_source=data_path,
-                symbol=symbol,
-                lower_timeframe=settings.lower_timeframe,
-                higher_timeframe=settings.higher_timeframe,
-            )
+            for pair_list in strategy_pairs.values():
+                for pair in pair_list:
+                    lower_tf = str(pair["lower_timeframe"])
+                    higher_tf = str(pair["higher_timeframe"])
+                    for timeframe in (lower_tf, higher_tf):
+                        if timeframe in frames_by_timeframe:
+                            continue
+                        resolved_path = resolve_backtest_timeframe_file(data_source=data_path, symbol=symbol, timeframe=timeframe)
+                        frames_by_timeframe[timeframe] = load_ohlc_frame(resolved_path)
+                        timeframe_paths[timeframe] = resolved_path
         except FileNotFoundError as exc:
             logger.error("%s", exc)
             return 1
@@ -188,9 +222,19 @@ def main() -> int:
             return 1
 
         required_columns = {"open", "high", "low", "close"}
-        if not required_columns.issubset(lower_frame.columns) or not required_columns.issubset(higher_frame.columns):
-            logger.error("CSV file missing OHLC columns")
-            return 1
+        for timeframe, frame in frames_by_timeframe.items():
+            if not required_columns.issubset(frame.columns):
+                logger.error("CSV file missing OHLC columns for timeframe %s", timeframe)
+                return 1
+
+        primary_strategy = strategy_names[0]
+        primary_pair = strategy_pairs[primary_strategy][0]
+        primary_lower_tf = str(primary_pair["lower_timeframe"])
+        primary_higher_tf = str(primary_pair["higher_timeframe"])
+        lower_frame = frames_by_timeframe[primary_lower_tf]
+        higher_frame = frames_by_timeframe[primary_higher_tf]
+        lower_path = timeframe_paths[primary_lower_tf]
+        higher_path = timeframe_paths[primary_higher_tf]
 
         chart_renderer = LiveChartRenderer(
             output_dir=Path("logs"),
@@ -215,15 +259,22 @@ def main() -> int:
             higher_frame=higher_frame,
             source_name=source_name,
             artifact_stem=artifact_stem,
+            frames_by_timeframe=frames_by_timeframe,
+            strategy_timeframe_paths=timeframe_paths,
         )
         results_dir = Path("backtest/results") / settings.backtest_results_subdir
         summary_path = _write_backtest_report(results_dir, artifact_stem, source_name, result)
+        source_labels: list[str] = []
+        for strategy_name in strategy_names:
+            for pair in strategy_pairs[strategy_name]:
+                lower_tf = str(pair["lower_timeframe"])
+                higher_tf = str(pair["higher_timeframe"])
+                source_labels.append(
+                    f"{strategy_name}:LTF={timeframe_paths[lower_tf]}({lower_tf}) HTF={timeframe_paths[higher_tf]}({higher_tf})"
+                )
         logger.info(
-            "Backtest sources | LTF=%s (%s) HTF=%s (%s) | lookback=%s %s | signals=%s",
-            lower_path,
-            settings.lower_timeframe,
-            higher_path,
-            settings.higher_timeframe,
+            "Backtest sources | %s | lookback=%s %s | signals=%s",
+            " ; ".join(source_labels),
             settings.backtest_lookback_value,
             settings.backtest_lookback_unit,
             result["total_signals"],

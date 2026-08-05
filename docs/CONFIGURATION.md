@@ -46,6 +46,7 @@ Used for both live and backtest runs.
 17. MAX_CYCLES
 18. CTRADER_POSITION_DB_PATH
 19. LOG_LEVEL
+20. STRATEGY_EVAL_LOG_VERBOSE
 
 Chart sizing behavior:
 - Chart size and visible candle windows are fully controlled by env variables above.
@@ -54,6 +55,8 @@ Chart sizing behavior:
 Logging behavior:
 - `LOG_LEVEL` controls runtime verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`).
 - Default is `DEBUG` when variable is not set.
+- `STRATEGY_EVAL_LOG_VERBOSE` controls detailed live strategy evaluation logs (`true` or `false`).
+- When enabled, logs include per-strategy and per-timeframe evaluation status (`running`, `successful`, `failed`) and decision outcomes.
 
 Broker symbol handling:
 - `SYMBOLS` accepts aliases such as `GOLD` or `XAUUSD`.
@@ -123,6 +126,13 @@ Used by the signal engine and ladder trade builder.
 4. GOLD_LADDER_STEP_RATIO
 5. GOLD_FIXED_LOT_SIZE
 
+Per-strategy timeframe and exit presets:
+
+1. `<STRATEGY>_LTF` and `<STRATEGY>_HTF` accept comma-separated lists (for example `M15,M30` and `H1,H4`).
+2. Both lists must have equal length so each LTF maps to one HTF.
+3. `<STRATEGY>_GOLD_STOP_LOSS_PIPS` and `<STRATEGY>_GOLD_TAKE_PROFIT_PIPS` accept either one value (broadcast to all pairs) or a list matching pair count.
+4. Invalid list lengths fail fast during settings load.
+
 ### Risk and Exit Settings
 
 Used to convert signals into trade plans.
@@ -149,7 +159,7 @@ ENABLE_TRADING=false
 PLOT_ENABLED=false
 SYMBOLS=XAUUSD
 TIMEFRAME=M15
-BACKTEST_DATA_DIR=path/to/your/candles.csv
+BACKTEST_DATA_DIR=path/to/your/candle_directory/
 BACKTEST_RESULTS_SUBDIR=gold_bot
 BACKTEST_SPEED=100ms
 GOLD_STRATEGY_NAMES=trend_following,price_action
