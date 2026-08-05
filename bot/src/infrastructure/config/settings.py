@@ -257,7 +257,7 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
     if not resolved_env_path.exists():
         raise ValueError(f"Environment file not found: {resolved_env_path}")
 
-    load_dotenv(str(resolved_env_path), override=False)
+    load_dotenv(str(resolved_env_path), override=True)
     backtest_speed_ms = _required_backtest_speed_ms()
 
     raw_strategy_names = []
