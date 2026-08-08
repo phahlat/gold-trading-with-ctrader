@@ -39,11 +39,13 @@ class LiveChartRenderer:
         self._figure: plt.Figure | None = None
         self._lower_ax: Any | None = None
         self._higher_ax: Any | None = None
-        self._equity_ax: Any | None = None
+        self._timeframe_figure: plt.Figure | None = None
+        self._timeframe_axes: dict[str, Any] = {}
+        self._timeframe_layout: tuple[str, ...] = ()
         self._max_lower_candles = max_lower_candles
         self._max_higher_candles = max_higher_candles
         normalized_strategies = {name.strip().lower() for name in (strategy_names or []) if str(name).strip()}
-        self._show_ema_overlay = bool(normalized_strategies.intersection({"trend_following"}))
+        self._show_ema_overlay = bool(normalized_strategies.intersection({"trend_following", "ema_crossover"}))
         self._ema_fast = max(1, int(ema_fast))
         self._ema_slow = max(1, int(ema_slow))
         self._ema_trend_period = max(1, int(ema_trend_period))
@@ -53,9 +55,9 @@ class LiveChartRenderer:
         self._direction_marker_size = max(4.0, float(direction_marker_size))
         self._window_shown = False
 
-    def _ensure_canvas(self) -> tuple[plt.Figure, Any, Any, Any]:
-        if self._figure is not None and self._lower_ax is not None and self._higher_ax is not None and self._equity_ax is not None:
-            return self._figure, self._lower_ax, self._higher_ax, self._equity_ax
+    def _ensure_canvas(self) -> tuple[plt.Figure, Any, Any]:
+        if self._figure is not None and self._lower_ax is not None and self._higher_ax is not None:
+            return self._figure, self._lower_ax, self._higher_ax
 
         if self._interactive:
             try:
@@ -66,11 +68,10 @@ class LiveChartRenderer:
 
         fig = plt.figure(figsize=(self._chart_width, self._chart_height), constrained_layout=True)
         fig.set_size_inches(self._chart_width, self._chart_height, forward=True)
-        grid = fig.add_gridspec(2, 2, height_ratios=[3, 1])
+        grid = fig.add_gridspec(1, 2)
         lower_ax = fig.add_subplot(grid[0, 0])
         higher_ax = fig.add_subplot(grid[0, 1])
-        equity_ax = fig.add_subplot(grid[1, :])
-        for ax in (lower_ax, higher_ax, equity_ax):
+        for ax in (lower_ax, higher_ax):
             ax.set_facecolor("#000000")
             ax.tick_params(colors="white")
             for spine in ax.spines.values():
@@ -82,7 +83,6 @@ class LiveChartRenderer:
         self._figure = fig
         self._lower_ax = lower_ax
         self._higher_ax = higher_ax
-        self._equity_ax = equity_ax
         if self._interactive and not self._window_shown:
             try:
                 plt.show(block=False)
@@ -96,7 +96,7 @@ class LiveChartRenderer:
             except Exception:  # pragma: no cover - backend dependent
                 logger.warning("Interactive show call failed; continuing with file snapshots only.")
                 self._interactive = False
-        return fig, lower_ax, higher_ax, equity_ax
+        return fig, lower_ax, higher_ax
 
     @staticmethod
     def _clip_frame(frame: pd.DataFrame, max_points: int) -> pd.DataFrame:
@@ -203,6 +203,25 @@ class LiveChartRenderer:
                         ax.annotate(text, (x, y), textcoords="offset points", xytext=(3, 3), fontsize=7, color=color)
                 continue
 
+            if marker_kind in {"sl", "tp"}:
+                symbol = "-" if marker_kind == "sl" else "+"
+                font_size = self._sl_marker_size if marker_kind == "sl" else self._tp_marker_size
+                for x, y, text in zip(payload["x"], payload["y"], payload["labels"]):
+                    ax.text(
+                        x,
+                        y,
+                        symbol,
+                        color=color,
+                        fontsize=font_size,
+                        ha="center",
+                        va="center",
+                        fontweight="bold",
+                        zorder=7,
+                    )
+                    if text:
+                        ax.annotate(text, (x, y), textcoords="offset points", xytext=(3, 3), fontsize=7, color=color)
+                continue
+
             size = self._tp_marker_size if marker_kind == "tp" else self._sl_marker_size if marker_kind == "sl" else self._direction_marker_size
             ax.scatter(
                 payload["x"],
@@ -232,17 +251,17 @@ class LiveChartRenderer:
         account_snapshot: dict[str, Any] | None = None,
         account_change: dict[str, Any] | None = None,
         open_positions_count: int | None = None,
+        open_positions: list[dict[str, Any]] | None = None,
         equity_curve: list[dict[str, Any]] | None = None,
         ticker_point: dict[str, Any] | None = None,
         ticker_trail: list[dict[str, Any]] | None = None,
         mode_label: str = "live",
         output_name: str = "live_dual_chart.png",
     ) -> Path:
-        fig, lower_ax, higher_ax, equity_ax = self._ensure_canvas()
+        fig, lower_ax, higher_ax = self._ensure_canvas()
 
         lower_ax.clear()
         higher_ax.clear()
-        equity_ax.clear()
 
         lower_raw = self._normalize_frame(lower_frame)
         higher_raw = self._normalize_frame(higher_frame)
@@ -281,15 +300,15 @@ class LiveChartRenderer:
         self._draw_ticker_trail(higher_ax, ticker_trail, higher.index)
         self._draw_ticker_dot(lower_ax, ticker_point, lower.index)
         self._draw_ticker_dot(higher_ax, ticker_point, higher.index)
+        self._draw_open_position_levels(lower_ax, open_positions, lower.index, lower_timeframe)
+        self._draw_open_position_levels(higher_ax, open_positions, higher.index, higher_timeframe)
 
         lower_ax.set_title(f"{symbol} {lower_timeframe} Heikin-Ashi (last {len(lower)} bars)", color="white")
         higher_ax.set_title(f"{symbol} {higher_timeframe} Heikin-Ashi (last {len(higher)} bars)", color="white")
         lower_ax.grid(True, alpha=0.2)
         higher_ax.grid(True, alpha=0.2)
 
-        self._draw_equity_panel(equity_ax, equity_curve, mode_label)
-
-        self._draw_account_legend(fig, equity_ax, account_snapshot, account_change, open_positions_count)
+        self._draw_account_legend(lower_ax, account_snapshot, account_change, open_positions_count)
 
         if self._interactive:
             fig.canvas.draw()
@@ -299,6 +318,151 @@ class LiveChartRenderer:
         path = self.output_dir / output_name
         fig.savefig(path, dpi=150)
         return path
+
+    def render_timeframe_charts(
+        self,
+        frames_by_timeframe: dict[str, pd.DataFrame],
+        symbol: str,
+        markers_by_timeframe: dict[str, list[dict[str, Any]]] | None = None,
+        account_snapshot: dict[str, Any] | None = None,
+        account_change: dict[str, Any] | None = None,
+        open_positions_count: int | None = None,
+        open_positions: list[dict[str, Any]] | None = None,
+        ticker_point: dict[str, Any] | None = None,
+        ticker_trail: list[dict[str, Any]] | None = None,
+        mode_label: str = "live",
+        output_name_pattern: str = "{symbol}_{timeframe}_{mode}_heikinashi.png",
+    ) -> dict[str, Path]:
+        valid_frames = {
+            str(timeframe).strip().upper(): frame
+            for timeframe, frame in (frames_by_timeframe or {}).items()
+            if str(timeframe).strip() and isinstance(frame, pd.DataFrame) and not frame.empty
+        }
+        if not valid_frames:
+            return {}
+
+        sorted_timeframes = self._sorted_timeframes(list(valid_frames.keys()))
+        markers = markers_by_timeframe or {}
+        if self._interactive:
+            fig, axes_by_timeframe = self._ensure_multi_timeframe_canvas(sorted_timeframes)
+        else:
+            fig, axes_by_timeframe = self._create_multi_timeframe_canvas(sorted_timeframes)
+
+        for timeframe in sorted_timeframes:
+            ax = axes_by_timeframe[timeframe]
+            ax.clear()
+            ax.set_facecolor("#000000")
+            ax.tick_params(colors="white")
+            for spine in ax.spines.values():
+                spine.set_color("#444444")
+            ax.grid(True, alpha=0.2, color="white")
+            ax.xaxis.label.set_color("white")
+            ax.yaxis.label.set_color("white")
+
+            frame = valid_frames[timeframe]
+            raw = self._normalize_frame(frame)
+            clipped = self._clip_frame(raw, self._max_higher_candles if timeframe.startswith("H") else self._max_lower_candles)
+            ha = self._to_heikin_ashi(clipped)
+            if not ha.empty:
+                mpf.plot(
+                    ha,
+                    type="candle",
+                    style="charles",
+                    ax=ax,
+                    volume=False,
+                    xrotation=15,
+                    datetime_format="%d %H:%M",
+                    warn_too_much_data=max(10000, len(ha) + 1),
+                )
+                self._draw_ema_overlays(ax, clipped, ha.index)
+                self._plot_markers(ax, markers.get(timeframe, []), ha.index)
+                self._draw_ticker_trail(ax, ticker_trail, ha.index)
+                self._draw_ticker_dot(ax, ticker_point, ha.index)
+                self._draw_open_position_levels(ax, open_positions, ha.index, timeframe)
+
+            ax.set_title(f"{symbol} {timeframe} Heikin-Ashi {mode_label} (last {len(ha)} bars)", color="white")
+            self._draw_account_legend(ax, account_snapshot, account_change, open_positions_count)
+
+        if self._interactive:
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+            plt.pause(0.01)
+
+        output_path = self.output_dir / self._build_timeframe_output_name(output_name_pattern, symbol, "multi", mode_label)
+        fig.savefig(output_path, dpi=150)
+
+        if not self._interactive:
+            plt.close(fig)
+
+        output_paths: dict[str, Path] = {timeframe: output_path for timeframe in sorted_timeframes}
+        return output_paths
+
+    def _create_multi_timeframe_canvas(self, timeframes: list[str]) -> tuple[plt.Figure, dict[str, Any]]:
+        count = max(1, len(timeframes))
+        width = max(self._chart_width, self._chart_width * count)
+        fig = plt.figure(figsize=(width, self._chart_height), constrained_layout=True)
+        fig.patch.set_facecolor("#000000")
+        grid = fig.add_gridspec(1, count)
+        axes_by_timeframe: dict[str, Any] = {}
+        for idx, timeframe in enumerate(timeframes):
+            ax = fig.add_subplot(grid[0, idx])
+            axes_by_timeframe[timeframe] = ax
+        return fig, axes_by_timeframe
+
+    def _ensure_multi_timeframe_canvas(self, timeframes: list[str]) -> tuple[plt.Figure, dict[str, Any]]:
+        layout_key = tuple(timeframes)
+        if self._timeframe_figure is not None and self._timeframe_layout == layout_key and self._timeframe_axes:
+            return self._timeframe_figure, self._timeframe_axes
+
+        if self._timeframe_figure is not None:
+            plt.close(self._timeframe_figure)
+            self._timeframe_figure = None
+            self._timeframe_axes = {}
+
+        if self._interactive:
+            try:
+                plt.ion()
+            except Exception:  # pragma: no cover - backend dependent
+                logger.warning("Interactive backend unavailable. Falling back to snapshot plotting.")
+                self._interactive = False
+
+        fig, axes_by_timeframe = self._create_multi_timeframe_canvas(timeframes)
+        self._timeframe_figure = fig
+        self._timeframe_axes = axes_by_timeframe
+        self._timeframe_layout = layout_key
+
+        if self._interactive and not self._window_shown:
+            try:
+                plt.show(block=False)
+                self._window_shown = True
+            except Exception:  # pragma: no cover - backend dependent
+                logger.warning("Interactive show call failed; continuing with file snapshots only.")
+                self._interactive = False
+
+        return fig, axes_by_timeframe
+
+    @staticmethod
+    def _sorted_timeframes(timeframes: list[str]) -> list[str]:
+        def _key(value: str) -> tuple[int, int, str]:
+            token = str(value).strip().upper()
+            if len(token) < 2:
+                return (99, 0, token)
+            unit = token[0]
+            amount_text = token[1:]
+            if not amount_text.isdigit():
+                return (99, 0, token)
+            amount = int(amount_text)
+            order = {"M": 0, "H": 1, "D": 2, "W": 3}.get(unit, 99)
+            return (order, amount, token)
+
+        return sorted([str(tf).strip().upper() for tf in timeframes if str(tf).strip()], key=_key)
+
+    @staticmethod
+    def _build_timeframe_output_name(pattern: str, symbol: str, timeframe: str, mode_label: str) -> str:
+        try:
+            return str(pattern).format(symbol=symbol, timeframe=timeframe, mode=mode_label)
+        except Exception:
+            return f"{symbol}_{timeframe}_{mode_label}_heikinashi.png"
 
     def _draw_ema_overlays(self, ax: Any, raw_frame: pd.DataFrame, clipped_index: pd.Index) -> None:
         if not self._show_ema_overlay or raw_frame.empty or clipped_index.empty:
@@ -393,7 +557,6 @@ class LiveChartRenderer:
 
     def _draw_account_legend(
         self,
-        fig: plt.Figure,
         anchor_ax: Any,
         account_snapshot: dict[str, Any] | None,
         account_change: dict[str, Any] | None,
@@ -427,11 +590,92 @@ class LiveChartRenderer:
         legend.get_title().set_color("white")
         # fig.suptitle("Dual Timeframe Execution View", fontsize=13, y=0.98)
 
+    def _draw_open_position_levels(self, ax: Any, positions: list[dict[str, Any]] | None, index: pd.Index, timeframe: str) -> None:
+        if not positions or index.empty:
+            return
+
+        x_anchor = len(index) - 1
+        for item in positions:
+            if not self._position_matches_timeframe(item, timeframe):
+                continue
+            direction = str(item.get("direction") or "").strip().lower()
+            if not direction:
+                position_type = item.get("type")
+                direction = "buy" if int(position_type or 0) == 0 else "sell"
+
+            entry = self._safe_float(item.get("entry_price", item.get("price_open")))
+            stop_loss = self._safe_float(item.get("stop_loss", item.get("sl")))
+            take_profit = self._safe_float(item.get("take_profit", item.get("tp")))
+
+            self._draw_level_symbol(ax, x_anchor, entry, "$", "#f1c40f", "entry")
+            self._draw_level_symbol(ax, x_anchor, stop_loss, "-", "#ff4d4d", "sl")
+            self._draw_level_symbol(ax, x_anchor, take_profit, "+", "#2ecc71", "tp")
+
+    @staticmethod
+    def _position_matches_timeframe(position: dict[str, Any], timeframe: str) -> bool:
+        tf = str(timeframe).strip().upper()
+        if not tf:
+            return True
+
+        timeframes_value = str(position.get("timeframes") or "").strip().upper()
+        if timeframes_value:
+            normalized = (
+                timeframes_value.replace("/", ",")
+                .replace("-", ",")
+                .replace("#", ",")
+                .replace("|", ",")
+            )
+            tokens = [token.strip() for token in normalized.split(",") if token.strip()]
+            return tf in tokens
+
+        # If no timeframe metadata exists (for example external/manual positions),
+        # show overlays on all charts so data is not hidden.
+        return True
+
+    def _draw_level_symbol(self, ax: Any, x: int, price: float | None, symbol: str, color: str, tag: str) -> None:
+        if price is None or price <= 0:
+            return
+        ax.axhline(price, color=color, linestyle="--", linewidth=0.7, alpha=0.45, zorder=3)
+        ax.text(
+            x,
+            price,
+            symbol,
+            color=color,
+            fontsize=max(8.0, self._entry_marker_size),
+            ha="left",
+            va="center",
+            fontweight="bold",
+            zorder=8,
+        )
+        ax.annotate(
+            f"{tag} {price:.2f}",
+            (x, price),
+            textcoords="offset points",
+            xytext=(7, 1),
+            fontsize=7,
+            color=color,
+            zorder=8,
+        )
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not parsed or parsed <= 0:
+            return None
+        return parsed
+
     def close(self) -> None:
         if self._figure is not None:
             plt.close(self._figure)
+        if self._timeframe_figure is not None:
+            plt.close(self._timeframe_figure)
+        self._timeframe_figure = None
+        self._timeframe_axes = {}
+        self._timeframe_layout = ()
         self._figure = None
         self._lower_ax = None
         self._higher_ax = None
-        self._equity_ax = None
         self._window_shown = False

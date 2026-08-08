@@ -24,8 +24,15 @@ class GoldRunner:
         frame: pd.DataFrame,
         higher_frame: pd.DataFrame | None = None,
         strategy_names: list[str] | None = None,
+        context_key: str | None = None,
     ) -> list[Any]:
-        return self.engine.evaluate(frame, self.settings, higher_frame=higher_frame, strategy_names=strategy_names)
+        return self.engine.evaluate(
+            frame,
+            self.settings,
+            higher_frame=higher_frame,
+            strategy_names=strategy_names,
+            context_key=context_key,
+        )
 
     def run_once(self, frame: pd.DataFrame, higher_frame: pd.DataFrame | None = None) -> list[dict[str, Any]]:
         candidates = self.evaluate_candidates(frame, higher_frame=higher_frame)

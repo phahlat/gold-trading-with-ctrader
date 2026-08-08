@@ -37,6 +37,37 @@ REM Dry run
 .\.venv\Scripts\python.exe .\main.py --mode live --no-trade --symbols XAUUSD --strategy trend_following --no-plot --max-cycles 1
 ```
 
+## Docker
+
+Build and run with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Run in DEBUG mode to show cTrader connection endpoint strings and reconnect parameters in logs:
+
+```bash
+LOG_LEVEL=DEBUG docker compose up --build
+```
+
+The container writes runtime artifacts to host-mounted paths:
+
+1. `./logs` -> `/app/logs`
+2. `./backtest/results` -> `/app/backtest/results`
+3. `./position-data` -> `/app/position-data`
+
+The Compose service includes:
+
+1. A live heartbeat healthcheck based on `logs/live_heartbeat.json`
+2. SIGTERM-based graceful shutdown with a 45-second stop grace period
+
+Stop and remove the container:
+
+```bash
+docker compose down
+```
+
 ## Safety
 
 1. Use --no-trade for first-time validation and logic checks.

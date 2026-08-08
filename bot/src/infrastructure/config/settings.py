@@ -104,9 +104,11 @@ class GoldSettings:
     backtest_warn_volume_above: float
     backtest_warn_equity_multiplier: float
     strategy_names: list[str]
+    ema_timeframes: list[str]
     enable_multi_entry: bool
     ladder_entries: int
     ladder_step_ratio: float
+    risk_reward_ratio: float
     fixed_lot_size: float
     stop_loss_pips: float
     take_profit_pips: float
@@ -120,6 +122,8 @@ class GoldSettings:
     pip_size: float
     price_action_cooldown_minutes: float
     position_db_path: str
+    healthcheck_status_file: str
+    healthcheck_stale_seconds: float
     config_env_path: str
 
 
@@ -135,6 +139,36 @@ def _float_env(name: str, default: float) -> float:
 
 def _int_env(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)))
+
+
+def _first_env(names: list[str], default: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
+def _normalize_timeframe_token(value: str) -> str:
+    token = str(value or "").strip().upper()
+    if not token:
+        return ""
+    if token[-1] in {"M", "H", "D", "W"} and token[:-1].isdigit():
+        return f"{token[-1]}{token[:-1]}"
+    if token[0] in {"M", "H", "D", "W"} and token[1:].isdigit():
+        return token
+    if token.isdigit():
+        return f"M{token}"
+    return token
+
+
+def _parse_timeframes(raw_value: str) -> list[str]:
+    values: list[str] = []
+    for part in str(raw_value or "").split(","):
+        normalized = _normalize_timeframe_token(part)
+        if normalized:
+            values.append(normalized)
+    return values
 
 
 def _required_float_env(name: str) -> float:
@@ -250,6 +284,51 @@ def _strategy_preset_env(
     )
 
 
+def _ema_crossover_preset(
+    timeframes: list[str],
+    stop_loss_pips: float,
+    take_profit_pips: float,
+    stop_loss_list: list[float] | None = None,
+    take_profit_list: list[float] | None = None,
+) -> StrategyPreset:
+    normalized = [tf.strip().upper() for tf in timeframes if str(tf).strip()]
+    if not normalized:
+        normalized = ["M1", "M5", "M15"]
+    pair_count = len(normalized)
+
+    sl_values = [max(1.0, float(stop_loss_pips)) for _ in range(pair_count)]
+    tp_values = [max(1.0, float(take_profit_pips)) for _ in range(pair_count)]
+
+    if stop_loss_list:
+        raw_sl = [max(1.0, float(value)) for value in stop_loss_list]
+        if len(raw_sl) == 1:
+            sl_values = [raw_sl[0] for _ in range(pair_count)]
+        elif len(raw_sl) == pair_count:
+            sl_values = raw_sl
+        else:
+            raise ValueError(
+                f"Invalid EMA_CROSSOVER_GOLD_STOP_LOSS_PIPS list: expected 1 or {pair_count} item(s), got {len(raw_sl)}."
+            )
+
+    if take_profit_list:
+        raw_tp = [max(1.0, float(value)) for value in take_profit_list]
+        if len(raw_tp) == 1:
+            tp_values = [raw_tp[0] for _ in range(pair_count)]
+        elif len(raw_tp) == pair_count:
+            tp_values = raw_tp
+        else:
+            raise ValueError(
+                f"Invalid EMA_CROSSOVER_GOLD_TAKE_PROFIT_PIPS list: expected 1 or {pair_count} item(s), got {len(raw_tp)}."
+            )
+
+    return StrategyPreset(
+        lower_timeframes=normalized,
+        higher_timeframes=list(normalized),
+        stop_loss_pips_list=sl_values,
+        take_profit_pips_list=tp_values,
+    )
+
+
 def load_gold_settings(env_path: str = ".env") -> GoldSettings:
     resolved_env_path = _resolve_env_path(env_path)
     if resolved_env_path.name != ".env" and resolved_env_path.suffix != ".env":
@@ -260,6 +339,36 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
     load_dotenv(str(resolved_env_path), override=True)
     backtest_speed_ms = _required_backtest_speed_ms()
 
+    ema_fast = max(1, int(float(_first_env(["EMA_CROSSOVER_EMA_FAST", "EMA_FAST", "GOLD_EMA_FAST"], "9"))))
+    ema_slow = max(2, int(float(_first_env(["EMA_CROSSOVER_EMA_SLOW", "EMA_SLOW", "GOLD_EMA_SLOW"], "21"))))
+    ema_trend_period = max(
+        2,
+        int(
+            float(
+                _first_env(
+                    ["EMA_CROSSOVER_EMA_TREND_PERIOD", "EMA_TREND_PERIOD", "GOLD_EMA_TREND_PERIOD"],
+                    str(ema_slow),
+                )
+            )
+        ),
+    )
+    stop_loss_pips = max(1.0, float(_first_env(["EMA_CROSSOVER_STOP_LOSS_PIPS", "STOP_LOSS_PIPS"], "120")))
+    take_profit_pips = max(1.0, float(_first_env(["EMA_CROSSOVER_TAKE_PROFIT_PIPS", "TAKE_PROFIT_PIPS"], "250")))
+    ema_timeframes = _parse_timeframes(_first_env(["EMA_CROSSOVER_TIMEFRAMES", "TIMEFRAMES"], "1m,5m,15m"))
+    if not ema_timeframes:
+        ema_timeframes = ["M1", "M5", "M15"]
+    risk_reward_ratio = max(1.0, float(_first_env(["EMA_CROSSOVER_RISK_REWARD_RATIO", "RISK_REWARD_RATIO"], "2")))
+    ema_stop_loss_list = [
+        float(token.strip())
+        for token in str(os.getenv("EMA_CROSSOVER_GOLD_STOP_LOSS_PIPS", "")).split(",")
+        if token.strip()
+    ]
+    ema_take_profit_list = [
+        float(token.strip())
+        for token in str(os.getenv("EMA_CROSSOVER_GOLD_TAKE_PROFIT_PIPS", "")).split(",")
+        if token.strip()
+    ]
+
     raw_strategy_names = []
     for item in os.getenv("GOLD_STRATEGY_NAMES", "trend_following,price_action,session_breakout").split(","):
         cleaned = item.split("#", 1)[0].strip().lower()
@@ -269,13 +378,20 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
         "trend_following": _strategy_preset_env("TREND_FOLLOWING", "M15", "H1", 120.0, 250.0),
         "price_action": _strategy_preset_env("PRICE_ACTION", "M5", "M30", 80.0, 180.0),
         "session_breakout": _strategy_preset_env("SESSION_BREAKOUT", "M15", "H1", 100.0, 220.0),
+        "ema_crossover": _ema_crossover_preset(
+            ema_timeframes,
+            stop_loss_pips,
+            take_profit_pips,
+            stop_loss_list=ema_stop_loss_list,
+            take_profit_list=ema_take_profit_list,
+        ),
     }
     unsupported = [name for name in raw_strategy_names if name not in strategy_presets]
     if unsupported:
         raise ValueError(
             "Unsupported GOLD_STRATEGY_NAMES value(s): "
             + ",".join(unsupported)
-            + ". Supported: trend_following,price_action,session_breakout"
+            + ". Supported: trend_following,price_action,session_breakout,ema_crossover"
         )
     strategy_names = [name for name in raw_strategy_names if name in strategy_presets]
     if not strategy_names:
@@ -342,21 +458,28 @@ def load_gold_settings(env_path: str = ".env") -> GoldSettings:
         backtest_warn_volume_above=max(0.0, _float_env("BACKTEST_WARN_VOLUME_ABOVE", 5.0)),
         backtest_warn_equity_multiplier=max(1.0, _float_env("BACKTEST_WARN_EQUITY_MULTIPLIER", 20.0)),
         strategy_names=strategy_names,
+        ema_timeframes=ema_timeframes,
         enable_multi_entry=_bool_env(os.getenv("GOLD_ENABLE_MULTI_ENTRY"), default=True),
         ladder_entries=_int_env("GOLD_LADDER_ENTRIES", 3),
         ladder_step_ratio=max(0.01, _float_env("GOLD_LADDER_STEP_RATIO", 1.2)),
+        risk_reward_ratio=risk_reward_ratio,
         fixed_lot_size=max(0.0, _float_env("GOLD_FIXED_LOT_SIZE", 0.0)),
-        stop_loss_pips=primary_preset.stop_loss_pips,
-        take_profit_pips=primary_preset.take_profit_pips,
-        ema_fast=_int_env("GOLD_EMA_FAST", 9),
-        ema_slow=_int_env("GOLD_EMA_SLOW", 21),
-        ema_trend_period=_int_env("GOLD_EMA_TREND_PERIOD", 200),
+        stop_loss_pips=stop_loss_pips if primary_strategy == "ema_crossover" else primary_preset.stop_loss_pips,
+        take_profit_pips=take_profit_pips if primary_strategy == "ema_crossover" else primary_preset.take_profit_pips,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow,
+        ema_trend_period=ema_trend_period,
         max_daily_trades=_int_env("GOLD_MAX_DAILY_TRADES", 3),
-        max_open_positions=max(1, _int_env("GOLD_MAX_OPEN_POSITIONS", 2)),
+        max_open_positions=max(
+            1,
+            int(float(_first_env(["EMA_CROSSOVER_GLOBAL_POSITION_LIMIT", "GLOBAL_POSITION_LIMIT", "GOLD_MAX_OPEN_POSITIONS"], "2"))),
+        ),
         trade_magic_number=_int_env("GOLD_TRADE_MAGIC_NUMBER", 550015),
         trade_comment_prefix=os.getenv("GOLD_TRADE_COMMENT_PREFIX", "gold-bot"),
         pip_size=max(0.00001, _float_env("GOLD_PIP_SIZE", 0.01)),
         price_action_cooldown_minutes=max(0.0, _float_env("PRICE_ACTION_COOLDOWN_MINUTES", 0.0)),
         position_db_path=os.getenv("CTRADER_POSITION_DB_PATH", os.getenv("MT5_POSITION_DB_PATH", "logs/gold_positions.sqlite3")),
+        healthcheck_status_file=os.getenv("HEALTHCHECK_STATUS_FILE", "logs/live_heartbeat.json"),
+        healthcheck_stale_seconds=max(5.0, _float_env("HEALTHCHECK_STALE_SECONDS", 120.0)),
         config_env_path=str(resolved_env_path),
     )

@@ -11,6 +11,7 @@ from twisted.internet.task import LoopingCall
 
 from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+    ProtoOAAmendPositionSLTPReq,
     ProtoOAAccountAuthReq,
     ProtoOAApplicationAuthReq,
     ProtoOADealListReq,
@@ -75,6 +76,7 @@ class GoldCTraderConnector:
         self._connected = False
         self._account_id: int | None = None
         self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
 
         self._spot_by_symbol_id: dict[int, dict[str, float | int]] = {}
         self._subscribed_symbol_ids: set[int] = set()
@@ -88,6 +90,8 @@ class GoldCTraderConnector:
         self._last_activity_at: float | None = None
         self._heartbeat_loop: LoopingCall | None = None
         self._reconnect_timer: Any | None = None
+        self._reconnect_in_progress = False
+        self._intentional_disconnect = False
 
     def _volume_from_api(self, raw_volume: int | float) -> float:
         return float(raw_volume or 0.0) / 10000.0
@@ -96,8 +100,9 @@ class GoldCTraderConnector:
         return max(1, int(round(float(volume_lots) * 10000.0)))
 
     def connect(self) -> bool:
-        if self._connected:
-            return True
+        with self._state_lock:
+            if self._connected:
+                return True
 
         if not self._credentials_complete():
             logger.warning("cTrader credentials are incomplete; skipping live connection")
@@ -111,6 +116,12 @@ class GoldCTraderConnector:
         connect_timeout = max(2.0, float(getattr(self.settings, "ctrader_connect_timeout_seconds", 15.0)))
         attempts = max(1, int(getattr(self.settings, "ctrader_reconnect_attempts", 3)))
         wait_seconds = max(0.0, float(getattr(self.settings, "ctrader_reconnect_wait_seconds", 2.0)))
+        request_timeout = max(1.0, float(getattr(self.settings, "ctrader_request_timeout_seconds", 12.0)))
+        heartbeat_interval = max(0.1, float(getattr(self.settings, "ctrader_heartbeat_interval_seconds", 15.0)))
+        heartbeat_timeout = max(0.1, float(getattr(self.settings, "ctrader_heartbeat_timeout_seconds", 30.0)))
+
+        with self._state_lock:
+            self._intentional_disconnect = False
 
         logger.info(
             "cTrader Open API endpoints | protobuf_live=%s:%s protobuf_demo=%s:%s json_live=%s:%s json_demo=%s:%s",
@@ -128,6 +139,20 @@ class GoldCTraderConnector:
             host_name,
             host,
             EndPoints.PROTOBUF_PORT,
+        )
+        logger.debug(
+            "cTrader connect parameters | connection_string=tcp://%s:%s request_timeout=%.1fs connect_timeout=%.1fs reconnect_attempts=%s reconnect_wait_seconds=%.1fs heartbeat_interval_seconds=%.1fs heartbeat_timeout_seconds=%.1fs requested_account_id=%s preferred_live_account_id=%s preferred_demo_account_id=%s",
+            host,
+            EndPoints.PROTOBUF_PORT,
+            request_timeout,
+            connect_timeout,
+            attempts,
+            wait_seconds,
+            heartbeat_interval,
+            heartbeat_timeout,
+            int(getattr(self.settings, "ctrader_account_id", 0) or 0),
+            int(getattr(self.settings, "ctrader_live_account_id", 0) or 0),
+            int(getattr(self.settings, "ctrader_demo_account_id", 0) or 0),
         )
 
         for attempt in range(1, attempts + 1):
@@ -161,7 +186,8 @@ class GoldCTraderConnector:
                     time.sleep(wait_seconds)
                 continue
 
-            self._connected = True
+            with self._state_lock:
+                self._connected = True
             self._last_activity_at = time.monotonic()
             self._start_heartbeat_loop()
             logger.info(
@@ -177,6 +203,10 @@ class GoldCTraderConnector:
         return False
 
     def disconnect(self) -> None:
+        with self._state_lock:
+            self._intentional_disconnect = True
+            self._connected = False
+
         if self._client and self._account_id is not None and self._subscribed_symbol_ids:
             try:
                 req = ProtoOAUnsubscribeSpotsReq()
@@ -196,12 +226,14 @@ class GoldCTraderConnector:
         self._stop_heartbeat_loop()
         self._cancel_reconnect_timer()
         self._client = None
-        self._connected = False
         self._account_id = None
         self._subscribed_symbol_ids.clear()
         self._spot_by_symbol_id.clear()
         self._socket_connected_event.clear()
         self._last_activity_at = None
+
+        with self._state_lock:
+            self._intentional_disconnect = False
 
     def account_info(self) -> dict[str, Any] | None:
         if not self._connected or self._account_id is None:
@@ -450,6 +482,55 @@ class GoldCTraderConnector:
             "price": execution_price,
             "volume": float(volume),
             "filling": "market",
+        }
+
+    def amend_position_protection(
+        self,
+        ticket: int,
+        stop_loss: float | None,
+        take_profit: float | None,
+    ) -> dict[str, Any]:
+        if not self._connected or self._account_id is None:
+            return {"ok": False, "reason": "not_connected"}
+
+        position_id = int(ticket or 0)
+        if position_id <= 0:
+            return {"ok": False, "reason": "invalid_ticket"}
+
+        req = ProtoOAAmendPositionSLTPReq()
+        req.ctidTraderAccountId = int(self._account_id)
+        req.positionId = position_id
+        if stop_loss is not None:
+            req.stopLoss = float(stop_loss)
+        if take_profit is not None:
+            req.takeProfit = float(take_profit)
+
+        result = self._send_and_extract(req)
+        if not isinstance(result, ProtoOAExecutionEvent):
+            return {"ok": False, "reason": "unexpected_response", "details": str(type(result))}
+
+        if getattr(result, "errorCode", ""):
+            return {"ok": False, "reason": "rejected", "details": str(result.errorCode)}
+
+        execution_type = int(getattr(result, "executionType", 0))
+        rejected = execution_type in {
+            ProtoOAExecutionType.Value("ORDER_REJECTED"),
+            ProtoOAExecutionType.Value("ORDER_CANCEL_REJECTED"),
+        }
+        if rejected:
+            return {
+                "ok": False,
+                "reason": "rejected",
+                "retcode": execution_type,
+                "details": str(execution_type),
+            }
+
+        return {
+            "ok": True,
+            "retcode": execution_type,
+            "ticket": position_id,
+            "stop_loss": float(stop_loss) if stop_loss is not None else None,
+            "take_profit": float(take_profit) if take_profit is not None else None,
         }
 
     def session_trade_performance(
@@ -771,6 +852,14 @@ class GoldCTraderConnector:
         self._stop_heartbeat_loop()
         self._cancel_reconnect_timer()
         self._mark_activity()
+        with self._state_lock:
+            self._connected = False
+            intentional = self._intentional_disconnect
+
+        if intentional:
+            logger.debug("Skipping auto-reconnect because disconnect was intentional")
+            return
+
         self._schedule_reconnect(delay=0.0)
 
     def _send_and_extract(self, request: Any, timeout: float | None = None) -> Any:
@@ -802,7 +891,10 @@ class GoldCTraderConnector:
                 except Exception as exc:
                     _err(exc)
 
-            reactor.callFromThread(_dispatch)
+            if threading.current_thread() is _REACTOR_THREAD:
+                _dispatch()
+            else:
+                reactor.callFromThread(_dispatch)
 
         if not event.wait(max(0.5, wait_timeout)):
             raise TimeoutError(f"Timed out waiting for cTrader response to {type(request).__name__}")
@@ -849,16 +941,22 @@ class GoldCTraderConnector:
         self._mark_activity()
 
     def _handle_stale_connection(self) -> None:
-        if not self._connected:
+        with self._state_lock:
+            is_connected = self._connected
+        if not is_connected:
             return
         self._cancel_reconnect_timer()
         self._stop_heartbeat_loop()
         self._socket_connected_event.clear()
-        self._connected = False
+        with self._state_lock:
+            self._connected = False
         self.disconnect()
         self._schedule_reconnect(delay=0.0)
 
     def _schedule_reconnect(self, delay: float | None = None) -> None:
+        with self._state_lock:
+            if self._intentional_disconnect or self._reconnect_in_progress:
+                return
         if self._reconnect_timer is not None and self._reconnect_timer.active():
             return
         reconnect_delay = 0.0 if delay is None else float(delay)
@@ -874,10 +972,31 @@ class GoldCTraderConnector:
 
     def _reconnect(self) -> None:
         self._cancel_reconnect_timer()
+
+        with self._state_lock:
+            if self._connected or self._reconnect_in_progress:
+                return
+            self._reconnect_in_progress = True
+
         logger.info("Reconnecting cTrader session after socket disruption")
-        self.connect()
+
+        def _worker() -> None:
+            try:
+                try:
+                    self.disconnect()
+                except Exception:
+                    pass
+                self.connect()
+            finally:
+                with self._state_lock:
+                    self._reconnect_in_progress = False
+
+        threading.Thread(target=_worker, name="ctrader-reconnect-worker", daemon=True).start()
 
     def _call_in_reactor(self, fn: Any, timeout: float) -> Any:
+        if threading.current_thread() is _REACTOR_THREAD:
+            return fn()
+
         done = threading.Event()
         state: dict[str, Any] = {"value": None, "error": None}
 

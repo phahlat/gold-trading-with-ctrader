@@ -5,6 +5,7 @@ The bot supports three strategies:
 1. trend_following
 2. price_action
 3. session_breakout
+4. ema_crossover
 
 ## Timeframe Model
 
@@ -65,6 +66,29 @@ Signal model:
 1. Build prior 8-candle session range on LTF.
 2. Buy when latest close breaks session high.
 3. Sell when latest close breaks session low.
+
+### ema_crossover
+
+Signal model (per timeframe state machine):
+
+1. Candle 1 must close above EMA slow for bullish, below EMA slow for bearish.
+2. Candle 2 confirmations:
+3. Bullish: close >= Candle 1 close -> buy confirmation.
+4. Bullish continuation: close < Candle 1 close and still above EMA slow -> wait Candle 3.
+5. Bullish Candle 3: close > Candle 1 and Candle 2 close, or close == Candle 1 close -> buy confirmation.
+6. Bearish: close >= Candle 1 close and still below EMA slow -> sell confirmation.
+7. Bearish continuation: close < Candle 1 close and still below EMA slow -> wait Candle 3.
+8. Bearish Candle 3: close > Candle 1 and Candle 2 close -> sell confirmation; otherwise reset.
+
+Environment variables used by this strategy:
+
+1. EMA_FAST
+2. EMA_SLOW
+3. STOP_LOSS_PIPS
+4. TAKE_PROFIT_PIPS
+5. TIMEFRAMES
+6. RISK_REWARD_RATIO
+7. GLOBAL_POSITION_LIMIT
 
 ## HTF Bias Filter
 

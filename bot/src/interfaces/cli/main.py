@@ -4,6 +4,7 @@ import argparse
 import csv
 import logging
 import os
+import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -328,7 +329,22 @@ def main() -> int:
         position_store=position_store,
         chart_renderer=chart_renderer,
     )
-    return live_service.run()
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _handle_shutdown_signal(signum: int, _frame: object) -> None:
+        name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+        logger.warning("Received %s; requesting graceful shutdown", name)
+        live_service.request_shutdown(reason=name)
+
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    try:
+        return live_service.run()
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

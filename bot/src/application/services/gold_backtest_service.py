@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import defaultdict
 from typing import Any
 
 import pandas as pd
@@ -23,6 +24,7 @@ class GoldBacktestService:
         self.chart_renderer = chart_renderer
         self.position_store = position_store or GoldPositionStore(getattr(settings, "position_db_path", "logs/gold_positions.sqlite3"))
         self._open_positions: list[dict[str, Any]] = []
+        self._entry_direction_lock_by_pair: dict[str, str] = {}
 
     def run(
         self,
@@ -80,7 +82,9 @@ class GoldBacktestService:
 
         history: list[dict[str, Any]] = []
         markers: list[dict[str, Any]] = []
+        markers_by_timeframe: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._open_positions = []
+        self._entry_direction_lock_by_pair = {}
         wins = 0
         losses = 0
         breakeven = 0
@@ -148,14 +152,25 @@ class GoldBacktestService:
                 candidates: list[Any] = []
                 for strategy_name in strategy_names:
                     candidates.extend(
-                        self.runner.evaluate_candidates(
+                        self._evaluate_candidates(
                             lower_slab,
                             higher_frame=higher_slab,
                             strategy_names=[strategy_name],
+                            context_key=f"{strategy_name}:{self.settings.lower_timeframe}:{self.settings.higher_timeframe}:0",
                         )
                     )
                 logger.info("📈 Cycle %s generated %s candidate signal(s)", idx + 1, len(candidates))
                 for candidate in candidates:
+                    strategy_key = str(getattr(candidate, "strategy", "")).strip().lower()
+                    pair_lock_key = f"{strategy_key}:{str(self.settings.lower_timeframe).upper()}/{str(self.settings.higher_timeframe).upper()}#1"
+                    if not self._direction_lock_allows_candidate(pair_lock_key, str(getattr(candidate, "direction", ""))):
+                        logger.info(
+                            "🔒 Backtest signal skipped (direction lock active) | lock_key=%s direction=%s",
+                            pair_lock_key,
+                            str(getattr(candidate, "direction", "")).lower(),
+                        )
+                        continue
+
                     preset = self._strategy_runtime_config(str(getattr(candidate, "strategy", "")))
                     stop_loss_pips = float(preset["stop_loss_pips"])
                     take_profit_pips = float(preset["take_profit_pips"])
@@ -269,6 +284,8 @@ class GoldBacktestService:
                             take_profit_pips=float(ladder_trade.get("take_profit_pips", take_profit_pips)),
                         )
                         markers.extend(trade_markers)
+                        markers_by_timeframe[str(self.settings.lower_timeframe).upper()].extend(trade_markers)
+                        markers_by_timeframe[str(self.settings.higher_timeframe).upper()].extend(trade_markers)
                         entry_price = float(trade_markers[0]["price"]) if trade_markers else float(candidate.price)
                         sl_price = float(trade_markers[1]["price"]) if len(trade_markers) > 1 else float(candidate.price)
                         tp_price = float(trade_markers[2]["price"]) if len(trade_markers) > 2 else float(candidate.price)
@@ -320,6 +337,13 @@ class GoldBacktestService:
                                 "opened_at": str(ts),
                             }
                         )
+
+                    self._entry_direction_lock_by_pair[pair_lock_key] = str(candidate.direction).lower()
+                    logger.info(
+                        "🔒 Backtest direction lock set | lock_key=%s direction=%s",
+                        pair_lock_key,
+                        str(candidate.direction).lower(),
+                    )
                     signal = {
                         "strategy": candidate.strategy,
                         "direction": candidate.direction,
@@ -344,25 +368,28 @@ class GoldBacktestService:
                     signal["stop_loss"] = exit_targets["stop_loss"]
                     signal["take_profit"] = exit_targets["take_profit"]
                     history.append(signal)
-                    markers.append({"datetime": ts, "price": float(candidate.price), "direction": candidate.direction, "type": "signal"})
+                    signal_marker = {"datetime": ts, "price": float(candidate.price), "direction": candidate.direction, "type": "signal"}
+                    markers.append(signal_marker)
+                    markers_by_timeframe[str(self.settings.lower_timeframe).upper()].append(signal_marker)
+                    markers_by_timeframe[str(self.settings.higher_timeframe).upper()].append(signal_marker)
 
                 equity_curve.append({"datetime": ts, "equity": equity, "balance": equity})
 
                 if self.settings.plot_enabled and (idx % self.settings.refresh_candle_count == 0 or idx == len(working_lower) - 1):
-                    self.chart_renderer.render_dual_timeframe(
-                        lower_frame=lower_slab,
-                        higher_frame=higher_slab,
+                    chart_frames = {
+                        str(self.settings.lower_timeframe).upper(): lower_slab,
+                        str(self.settings.higher_timeframe).upper(): higher_slab,
+                    }
+                    self.chart_renderer.render_timeframe_charts(
+                        frames_by_timeframe=chart_frames,
                         symbol=self.settings.symbols[0] if self.settings.symbols else "XAUUSD",
-                        lower_timeframe=self.settings.lower_timeframe,
-                        higher_timeframe=self.settings.higher_timeframe,
-                        lower_markers=markers,
-                        higher_markers=markers,
+                        markers_by_timeframe=markers_by_timeframe,
                         account_snapshot=account_snapshot,
                         account_change=account_change,
                         open_positions_count=len(self._open_positions),
-                        equity_curve=equity_curve,
+                        open_positions=self._open_positions,
                         mode_label="backtest",
-                        output_name=f"{artifact_stem}_backtest_heikinashi.png",
+                        output_name_pattern=f"{artifact_stem}_{{timeframe}}_backtest_heikinashi.png",
                     )
                     delay_seconds = max(0.0, float(self.settings.backtest_speed_ms) / 1000.0)
                     if delay_seconds > 0:
@@ -488,7 +515,9 @@ class GoldBacktestService:
 
         history: list[dict[str, Any]] = []
         markers: list[dict[str, Any]] = []
+        markers_by_timeframe: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._open_positions = []
+        self._entry_direction_lock_by_pair = {}
         wins = 0
         losses = 0
         breakeven = 0
@@ -503,11 +532,6 @@ class GoldBacktestService:
         profile = self._resolve_backtest_profile()
         requested_symbol = self.settings.symbols[0] if self.settings.symbols else "XAUUSD"
         equity_curve: list[dict[str, Any]] = []
-
-        primary_strategy = strategy_names[0]
-        primary_config = strategy_configs[primary_strategy][0]
-        primary_ltf = str(primary_config["lower_timeframe"]).upper()
-        primary_htf = str(primary_config["higher_timeframe"]).upper()
 
         logger.info("🚀 Backtest service started | symbol=%s strategies=%s", requested_symbol, ",".join(strategy_names))
         logger.info(
@@ -608,14 +632,24 @@ class GoldBacktestService:
                     lower_slab = slab["lower_slab"]
                     higher_slab = slab["higher_slab"]
 
-                    candidates = self.runner.evaluate_candidates(
+                    candidates = self._evaluate_candidates(
                         lower_slab,
                         higher_frame=higher_slab,
                         strategy_names=[strategy_name],
+                        context_key=f"{strategy_name}:{lower_tf}:{higher_tf}:{pair_index}",
                     )
                     total_candidates += len(candidates)
 
                     for candidate in candidates:
+                        pair_lock_key = f"{str(candidate.strategy).strip().lower()}:{lower_tf}/{higher_tf}#{pair_index + 1}"
+                        if not self._direction_lock_allows_candidate(pair_lock_key, str(getattr(candidate, "direction", ""))):
+                            logger.info(
+                                "🔒 Backtest signal skipped (direction lock active) | lock_key=%s direction=%s",
+                                pair_lock_key,
+                                str(getattr(candidate, "direction", "")).lower(),
+                            )
+                            continue
+
                         raw_volume, sizing_rule = self._resolve_backtest_volume(equity)
                         volume, was_capped = self._normalize_backtest_volume(raw_volume, profile)
                         pair_tag = f"{lower_tf}/{higher_tf}#{pair_index + 1}"
@@ -697,6 +731,8 @@ class GoldBacktestService:
                                 take_profit_pips=float(ladder_trade.get("take_profit_pips", take_profit_pips)),
                             )
                             markers.extend(trade_markers)
+                            markers_by_timeframe[lower_tf].extend(trade_markers)
+                            markers_by_timeframe[higher_tf].extend(trade_markers)
                             entry_price = float(trade_markers[0]["price"]) if trade_markers else float(candidate.price)
                             sl_price = float(trade_markers[1]["price"]) if len(trade_markers) > 1 else float(candidate.price)
                             tp_price = float(trade_markers[2]["price"]) if len(trade_markers) > 2 else float(candidate.price)
@@ -745,6 +781,13 @@ class GoldBacktestService:
                             self._open_positions.append(position_payload)
                             self.position_store.upsert_position(position_payload)
 
+                        self._entry_direction_lock_by_pair[pair_lock_key] = str(candidate.direction).lower()
+                        logger.info(
+                            "🔒 Backtest direction lock set | lock_key=%s direction=%s",
+                            pair_lock_key,
+                            str(candidate.direction).lower(),
+                        )
+
                         signal = {
                             "strategy": candidate.strategy,
                             "strategy_key": strategy_key,
@@ -772,7 +815,10 @@ class GoldBacktestService:
                         signal["stop_loss"] = exit_targets["stop_loss"]
                         signal["take_profit"] = exit_targets["take_profit"]
                         history.append(signal)
-                        markers.append({"datetime": ts, "price": float(candidate.price), "direction": candidate.direction, "type": "signal"})
+                        signal_marker = {"datetime": ts, "price": float(candidate.price), "direction": candidate.direction, "type": "signal"}
+                        markers.append(signal_marker)
+                        markers_by_timeframe[lower_tf].append(signal_marker)
+                        markers_by_timeframe[higher_tf].append(signal_marker)
 
                 if total_candidates:
                     logger.info("📈 Cycle %s generated %s candidate signal(s)", idx + 1, total_candidates)
@@ -780,31 +826,31 @@ class GoldBacktestService:
                 equity_curve.append({"datetime": ts, "equity": equity, "balance": equity})
 
                 if self.settings.plot_enabled and (idx % self.settings.refresh_candle_count == 0 or idx == len(ordered_timestamps) - 1):
-                    primary_slab = next(
-                        (
-                            slab
-                            for slab in strategy_slabs
-                            if str(slab["strategy_name"]) == primary_strategy and int(slab["pair_index"]) == int(primary_config.get("pair_index", 0))
-                        ),
-                        None,
-                    )
-                    chart_lower = primary_slab["lower_slab"] if primary_slab is not None else pd.DataFrame()
-                    chart_higher = primary_slab["higher_slab"] if primary_slab is not None else pd.DataFrame()
-                    if not chart_lower.empty and not chart_higher.empty:
-                        self.chart_renderer.render_dual_timeframe(
-                            lower_frame=chart_lower,
-                            higher_frame=chart_higher,
+                    chart_frames: dict[str, pd.DataFrame] = {}
+                    for slab in strategy_slabs:
+                        ltf = str(slab["lower_timeframe"]).upper()
+                        htf = str(slab["higher_timeframe"]).upper()
+                        lower_slab = slab["lower_slab"]
+                        higher_slab = slab["higher_slab"]
+                        if isinstance(lower_slab, pd.DataFrame) and not lower_slab.empty:
+                            existing_ltf = chart_frames.get(ltf, pd.DataFrame())
+                            if existing_ltf.empty or len(lower_slab) >= len(existing_ltf):
+                                chart_frames[ltf] = lower_slab
+                        if isinstance(higher_slab, pd.DataFrame) and not higher_slab.empty:
+                            existing_htf = chart_frames.get(htf, pd.DataFrame())
+                            if existing_htf.empty or len(higher_slab) >= len(existing_htf):
+                                chart_frames[htf] = higher_slab
+                    if chart_frames:
+                        self.chart_renderer.render_timeframe_charts(
+                            frames_by_timeframe=chart_frames,
                             symbol=self.settings.symbols[0] if self.settings.symbols else "XAUUSD",
-                            lower_timeframe=primary_ltf,
-                            higher_timeframe=primary_htf,
-                            lower_markers=markers,
-                            higher_markers=markers,
+                            markers_by_timeframe=markers_by_timeframe,
                             account_snapshot=account_snapshot,
                             account_change=account_change,
                             open_positions_count=len(self._open_positions),
-                            equity_curve=equity_curve,
+                            open_positions=self._open_positions,
                             mode_label="backtest",
-                            output_name=f"{artifact_stem}_backtest_heikinashi.png",
+                            output_name_pattern=f"{artifact_stem}_{{timeframe}}_backtest_heikinashi.png",
                         )
                         delay_seconds = max(0.0, float(self.settings.backtest_speed_ms) / 1000.0)
                         if delay_seconds > 0:
@@ -898,6 +944,27 @@ class GoldBacktestService:
         for row in normalized:
             lines.append(" | ".join(row[col].ljust(widths[col]) for col in columns))
         return "\n".join(lines)
+
+    def _evaluate_candidates(
+        self,
+        frame: pd.DataFrame,
+        higher_frame: pd.DataFrame | None,
+        strategy_names: list[str],
+        context_key: str,
+    ) -> list[Any]:
+        try:
+            return self.runner.evaluate_candidates(
+                frame,
+                higher_frame=higher_frame,
+                strategy_names=strategy_names,
+                context_key=context_key,
+            )
+        except TypeError:
+            return self.runner.evaluate_candidates(
+                frame,
+                higher_frame=higher_frame,
+                strategy_names=strategy_names,
+            )
 
     def _normalize_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
         working = frame.copy()
@@ -1003,6 +1070,28 @@ class GoldBacktestService:
             {"datetime": ts, "price": sl_price, "direction": direction, "type": "sl", "label": ""},
             {"datetime": ts, "price": tp_price, "direction": direction, "type": "tp", "label": ""},
         ]
+
+    def _direction_lock_allows_candidate(self, lock_key: str, candidate_direction: str) -> bool:
+        key = str(lock_key).strip().lower()
+        direction = str(candidate_direction).strip().lower()
+        if not key or direction not in {"buy", "sell"}:
+            return True
+
+        locked = str(self._entry_direction_lock_by_pair.get(key, "")).strip().lower()
+        if not locked:
+            return True
+
+        if locked != direction:
+            self._entry_direction_lock_by_pair.pop(key, None)
+            logger.info(
+                "🔓 Backtest direction lock released by opposite signal | lock_key=%s previous=%s incoming=%s",
+                key,
+                locked,
+                direction,
+            )
+            return True
+
+        return False
 
     def _update_open_positions(self, ts: Any, close_price: float, equity: float) -> tuple[float, int]:
         remaining_positions: list[dict[str, Any]] = []

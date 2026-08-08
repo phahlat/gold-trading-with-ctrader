@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+import threading
 import math
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -48,15 +52,52 @@ class GoldLiveService:
         self._orders_attempted: int = 0
         self._orders_filled: int = 0
         self._orders_rejected: int = 0
+        self._last_plotted_closed_ts_by_timeframe: dict[str, str] = {}
+        self._entry_direction_lock_by_pair: dict[str, str] = {}
+        self._trailing_activated_positions: set[str] = set()
+        self._last_trailing_stop_by_position: dict[str, float] = {}
+        self._stop_requested = threading.Event()
+        self._shutdown_reason = "not_requested"
+        self._healthcheck_status_file = Path(getattr(self.settings, "healthcheck_status_file", "logs/live_heartbeat.json"))
 
     def _log_strategy_eval(self, message: str, *args: Any) -> None:
         if bool(getattr(self.settings, "strategy_eval_log_verbose", True)):
             logger.info(message, *args)
 
+    def _evaluate_candidates(
+        self,
+        frame: pd.DataFrame,
+        higher_frame: pd.DataFrame | None,
+        strategy_names: list[str],
+        context_key: str,
+    ) -> list[Any]:
+        try:
+            return self.runner.evaluate_candidates(
+                frame,
+                higher_frame=higher_frame,
+                strategy_names=strategy_names,
+                context_key=context_key,
+            )
+        except TypeError:
+            return self.runner.evaluate_candidates(
+                frame,
+                higher_frame=higher_frame,
+                strategy_names=strategy_names,
+            )
+
+    def request_shutdown(self, reason: str = "external_signal") -> None:
+        if self._stop_requested.is_set():
+            return
+        self._shutdown_reason = str(reason)
+        self._stop_requested.set()
+        logger.warning("⏹️ Graceful shutdown requested | reason=%s", self._shutdown_reason)
+
     def run(self) -> int:
         requested_symbol = self.settings.symbols[0] if self.settings.symbols else "XAUUSD"
+        self._write_healthcheck(status="starting", symbol=requested_symbol)
         if not self.connector.connect():
             logger.error("❌ Live mode requires cTrader connectivity. Refusing CSV fallback.")
+            self._write_healthcheck(status="unhealthy", symbol=requested_symbol, run_status="connect_failed")
             return 1
 
         symbol = self.connector.resolve_symbol(requested_symbol)
@@ -109,6 +150,9 @@ class GoldLiveService:
 
         try:
             while True:
+                if self._stop_requested.is_set():
+                    run_status = f"shutdown_requested:{self._shutdown_reason}"
+                    break
                 if self.settings.max_cycles > 0 and cycle >= self.settings.max_cycles:
                     run_status = "completed_max_cycles"
                     break
@@ -128,7 +172,9 @@ class GoldLiveService:
                             symbol,
                             ",".join(sorted(missing_frames)),
                         )
-                        time.sleep(max(0.2, self.settings.poll_seconds))
+                        if self._sleep_interruptible(max(0.2, self.settings.poll_seconds)):
+                            run_status = f"shutdown_requested:{self._shutdown_reason}"
+                            break
                         continue
 
                     total_candidates = 0
@@ -176,6 +222,17 @@ class GoldLiveService:
                                 htf_ts,
                                 decision_context,
                             )
+                            self._log_decision_audit(
+                                symbol=symbol,
+                                strategy_name=strategy_name,
+                                pair_index=pair_index,
+                                lower_timeframe=lower_tf,
+                                higher_timeframe=higher_tf,
+                                lower_frame=lower_frame,
+                                higher_frame=higher_frame,
+                                status="evaluating",
+                                reason="strategy_check_started",
+                            )
 
                             htf_bias_context = self._higher_timeframe_bias_context(higher_frame)
                             logger.info(
@@ -190,10 +247,11 @@ class GoldLiveService:
                                 float(htf_bias_context["ema_trend"]),
                             )
 
-                            candidates = self.runner.evaluate_candidates(
+                            candidates = self._evaluate_candidates(
                                 lower_frame,
                                 higher_frame=higher_frame,
                                 strategy_names=[strategy_name],
+                                context_key=f"{strategy_name}:{lower_tf}:{higher_tf}:{pair_index}",
                             )
                             if not candidates:
                                 self._log_strategy_eval(
@@ -205,6 +263,17 @@ class GoldLiveService:
                                     ltf_ts,
                                     higher_tf,
                                     htf_ts,
+                                )
+                                self._log_decision_audit(
+                                    symbol=symbol,
+                                    strategy_name=strategy_name,
+                                    pair_index=pair_index,
+                                    lower_timeframe=lower_tf,
+                                    higher_timeframe=higher_tf,
+                                    lower_frame=lower_frame,
+                                    higher_frame=higher_frame,
+                                    status="no_signal",
+                                    reason="no_signal_passed_strategy_or_htf_filter",
                                 )
                             else:
                                 unique_reasons = sorted({str(getattr(item, "reason", "")) for item in candidates})
@@ -221,6 +290,17 @@ class GoldLiveService:
                                     len(candidates),
                                     directions,
                                     unique_reasons,
+                                )
+                                self._log_decision_audit(
+                                    symbol=symbol,
+                                    strategy_name=strategy_name,
+                                    pair_index=pair_index,
+                                    lower_timeframe=lower_tf,
+                                    higher_timeframe=higher_tf,
+                                    lower_frame=lower_frame,
+                                    higher_frame=higher_frame,
+                                    status="signal_generated",
+                                    reason="|".join(unique_reasons) if unique_reasons else "candidate_generated",
                                 )
                             total_candidates += len(candidates)
                             for candidate in candidates:
@@ -256,15 +336,40 @@ class GoldLiveService:
                         last_account_monitor = now
 
                     if self.settings.plot_enabled and now - last_plot_update >= self.settings.chart_update_seconds:
-                        primary = self._strategy_runtime_config(strategy_names[0])
-                        chart_ltf = str(primary["lower_timeframe"])
-                        chart_htf = str(primary["higher_timeframe"])
-                        lower_frame = frames_by_timeframe.get(chart_ltf, pd.DataFrame())
-                        higher_frame = frames_by_timeframe.get(chart_htf, pd.DataFrame())
-                        if lower_frame.empty or higher_frame.empty:
+                        active_timeframes = self._active_strategy_timeframes(strategy_names)
+                        chart_frames: dict[str, pd.DataFrame] = {}
+                        chart_last_closed: dict[str, str] = {}
+                        for tf in active_timeframes:
+                            raw = frames_by_timeframe.get(tf, pd.DataFrame())
+                            if raw.empty:
+                                continue
+                            closed = self._closed_candle_frame(raw, tf)
+                            if closed.empty:
+                                continue
+                            chart_frames[tf] = closed
+                            ts_value = closed.iloc[-1]["datetime"] if "datetime" in closed.columns else ""
+                            chart_last_closed[tf] = str(pd.to_datetime(ts_value, errors="coerce"))
+                        if not chart_frames:
                             cycle += 1
                             time.sleep(max(0.05, self.settings.poll_seconds))
                             continue
+
+                        has_new_closed_bar = False
+                        for tf, ts_value in chart_last_closed.items():
+                            if self._last_plotted_closed_ts_by_timeframe.get(tf) != ts_value:
+                                has_new_closed_bar = True
+                                break
+                        if not has_new_closed_bar:
+                            logger.debug(
+                                "🛰️ Plot skipped (no new closed candles) | last_closed=%s",
+                                chart_last_closed,
+                            )
+                            cycle += 1
+                            if self._sleep_interruptible(max(0.05, self.settings.poll_seconds)):
+                                run_status = f"shutdown_requested:{self._shutdown_reason}"
+                                break
+                            continue
+
                         tick_price = self.connector.current_price(symbol, "buy")
                         ticker_point = None
                         if tick_price is not None:
@@ -277,32 +382,32 @@ class GoldLiveService:
                             if len(self._tick_trail) > 40:
                                 self._tick_trail = self._tick_trail[-40:]
                         logger.info(
-                            "🛰️ Plot update input | ltf_rows=%s htf_rows=%s",
-                            len(lower_frame),
-                            len(higher_frame),
+                            "🛰️ Plot update input | timeframe_rows=%s closed_timestamps=%s",
+                            {tf: len(frame) for tf, frame in chart_frames.items()},
+                            chart_last_closed,
                         )
-                        chart_path = self.chart_renderer.render_dual_timeframe(
-                            lower_frame=lower_frame,
-                            higher_frame=higher_frame,
+                        chart_paths = self.chart_renderer.render_timeframe_charts(
+                            frames_by_timeframe=chart_frames,
                             symbol=symbol,
-                            lower_timeframe=chart_ltf,
-                            higher_timeframe=chart_htf,
-                            lower_markers=self._signal_markers_by_timeframe[chart_ltf],
-                            higher_markers=self._signal_markers_by_timeframe[chart_htf],
+                            markers_by_timeframe={tf: self._signal_markers_by_timeframe[tf] for tf in chart_frames.keys()},
                             account_snapshot=self._last_account_snapshot,
                             account_change=self._last_account_change,
                             open_positions_count=len(self._last_positions),
-                            equity_curve=self._equity_curve,
+                            open_positions=self._last_positions,
                             ticker_point=ticker_point,
                             ticker_trail=self._tick_trail,
                             mode_label="live",
-                            output_name=f"{symbol}_dual_live_heikinashi.png",
+                            output_name_pattern="{symbol}_{timeframe}_{mode}_heikinashi.png",
                         )
-                        logger.info("🖼️ Live chart refreshed: %s", chart_path)
+                        logger.info("🖼️ Live charts refreshed: %s", chart_paths)
+                        self._last_plotted_closed_ts_by_timeframe = chart_last_closed
                         last_plot_update = now
 
+                    self._write_healthcheck(status="running", symbol=symbol, cycle=cycle + 1)
                     cycle += 1
-                    time.sleep(max(0.05, self.settings.poll_seconds))
+                    if self._sleep_interruptible(max(0.05, self.settings.poll_seconds)):
+                        run_status = f"shutdown_requested:{self._shutdown_reason}"
+                        break
                 except (TimeoutError, RuntimeError) as exc:
                     if not self._is_connection_error(exc):
                         raise
@@ -316,10 +421,39 @@ class GoldLiveService:
             run_status = "canceled_by_user"
             logger.info("⏹️ Interrupted by user.")
         finally:
+            self._write_healthcheck(status="stopping", symbol=symbol, run_status=run_status, cycle=cycle)
             self._log_exit_summary(symbol=symbol, run_status=run_status)
             self.chart_renderer.close()
             self.connector.disconnect()
+            self._write_healthcheck(status="stopped", symbol=symbol, run_status=run_status, cycle=cycle)
         return 0
+
+    def _sleep_interruptible(self, seconds: float) -> bool:
+        return self._stop_requested.wait(timeout=max(0.0, float(seconds)))
+
+    def _write_healthcheck(
+        self,
+        status: str,
+        symbol: str,
+        run_status: str | None = None,
+        cycle: int | None = None,
+    ) -> None:
+        try:
+            self._healthcheck_status_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "status": str(status),
+                "symbol": str(symbol),
+                "run_status": str(run_status or ""),
+                "cycle": int(cycle or 0),
+                "shutdown_requested": bool(self._stop_requested.is_set()),
+                "shutdown_reason": str(self._shutdown_reason),
+                "pid": int(os.getpid()),
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "monotonic": float(time.monotonic()),
+            }
+            self._healthcheck_status_file.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception:
+            logger.debug("Unable to write live heartbeat file: %s", self._healthcheck_status_file, exc_info=True)
 
     def _pull_frame(self, symbol: str, timeframe: str) -> pd.DataFrame:
         bars = self.connector.get_rates(symbol=symbol, timeframe=timeframe, count=self._bars_to_pull(timeframe))
@@ -397,13 +531,27 @@ class GoldLiveService:
     def _recover_connection(self, requested_symbol: str) -> str | None:
         attempts = max(1, int(getattr(self.settings, "ctrader_reconnect_attempts", 5)))
         wait_seconds = max(0.0, float(getattr(self.settings, "ctrader_reconnect_wait_seconds", 30.0)))
+        connect_timeout = max(2.0, float(getattr(self.settings, "ctrader_connect_timeout_seconds", 15.0)))
+        request_timeout = max(1.0, float(getattr(self.settings, "ctrader_request_timeout_seconds", 12.0)))
         logger.warning(
             "⚠️ cTrader connectivity issue detected. Starting reconnect sequence | attempts=%s wait_seconds=%.1f",
             attempts,
             wait_seconds,
         )
+        logger.debug(
+            "cTrader reconnect parameters | requested_symbol=%s host=%s connect_timeout=%.1fs request_timeout=%.1fs attempts=%s wait_seconds=%.1fs",
+            requested_symbol,
+            str(getattr(self.settings, "ctrader_host", "live")).strip().lower(),
+            connect_timeout,
+            request_timeout,
+            attempts,
+            wait_seconds,
+        )
 
         for attempt in range(1, attempts + 1):
+            if self._stop_requested.is_set():
+                logger.warning("Reconnect aborted due to shutdown request")
+                return None
             logger.warning("🔌 Reconnect attempt %s/%s", attempt, attempts)
             try:
                 self.connector.disconnect()
@@ -428,7 +576,9 @@ class GoldLiveService:
 
             if attempt < attempts and wait_seconds > 0:
                 logger.info("⏳ Waiting %.1f seconds before next reconnect attempt", wait_seconds)
-                time.sleep(wait_seconds)
+                if self._sleep_interruptible(wait_seconds):
+                    logger.warning("Reconnect wait interrupted by shutdown request")
+                    return None
 
         logger.error("❌ Failed to restore cTrader connection after %s attempt(s).", attempts)
         return None
@@ -538,6 +688,7 @@ class GoldLiveService:
         ts = lower_frame.iloc[-1]["datetime"]
         strategy_name = str(getattr(candidate, "strategy", "")).strip().lower()
         pair_tag = f"{lower_timeframe}/{higher_timeframe}#{pair_index + 1}"
+        lock_key = f"{strategy_name}:{pair_tag}".lower()
         signal_key = f"{symbol}:{candidate.strategy}:{pair_tag}:{candidate.direction}:{ts.isoformat()}"
         decision_context = self._decision_context_for_candidate(
             strategy_name=strategy_name,
@@ -560,6 +711,20 @@ class GoldLiveService:
             higher_frame.iloc[-1]["datetime"] if not higher_frame.empty and "datetime" in higher_frame.columns else "n/a",
             decision_context,
         )
+
+        def _audit_outcome(status: str, reason: str) -> None:
+            self._log_decision_audit(
+                symbol=symbol,
+                strategy_name=strategy_name,
+                pair_index=pair_index,
+                lower_timeframe=lower_timeframe,
+                higher_timeframe=higher_timeframe,
+                lower_frame=lower_frame,
+                higher_frame=higher_frame,
+                status=status,
+                reason=reason,
+            )
+
         if signal_key in self._last_signal_keys:
             self._log_strategy_eval(
                 "🧪 Strategy decision result | status=failed symbol=%s strategy=%s pair=%s ltf=%s htf=%s reason=duplicate_signal",
@@ -570,6 +735,25 @@ class GoldLiveService:
                 higher_timeframe,
             )
             logger.debug("🔁 Duplicate signal skipped | key=%s", signal_key)
+            _audit_outcome("skipped", "duplicate_signal")
+            return
+
+        if not self._direction_lock_allows_candidate(lock_key, str(candidate.direction)):
+            self._log_strategy_eval(
+                "🧪 Strategy decision result | status=failed symbol=%s strategy=%s pair=%s ltf=%s htf=%s reason=direction_lock_active",
+                symbol,
+                candidate.strategy,
+                pair_tag,
+                lower_timeframe,
+                higher_timeframe,
+            )
+            logger.info(
+                "🔒 Signal skipped (direction lock active) | key=%s lock_key=%s direction=%s",
+                signal_key,
+                lock_key,
+                str(candidate.direction).lower(),
+            )
+            _audit_outcome("rejected", "direction_lock_active")
             return
 
         self._last_signal_keys.add(signal_key)
@@ -593,6 +777,7 @@ class GoldLiveService:
                 lower_timeframe,
                 higher_timeframe,
             )
+            _audit_outcome("dry_run", "dry_run_mode")
             return
 
         today_key = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
@@ -612,8 +797,46 @@ class GoldLiveService:
                 candidate.strategy,
                 candidate.direction,
             )
+            _audit_outcome("rejected", "position_lookup_failed")
             return
         strategy_open_positions = self._count_open_positions_by_strategy(open_positions)
+        if len(open_positions) >= max(1, int(getattr(self.settings, "max_open_positions", 1))):
+            self._log_strategy_eval(
+                "🧪 Strategy decision result | status=failed symbol=%s strategy=%s pair=%s ltf=%s htf=%s reason=global_position_limit_reached",
+                symbol,
+                candidate.strategy,
+                pair_tag,
+                lower_timeframe,
+                higher_timeframe,
+            )
+            logger.info(
+                "⛔ Signal not confirmed (global position limit reached) | key=%s strategy=%s open_positions=%s limit=%s",
+                signal_key,
+                candidate.strategy,
+                len(open_positions),
+                int(getattr(self.settings, "max_open_positions", 1)),
+            )
+            _audit_outcome("rejected", "global_position_limit_reached")
+            return
+
+        if self._has_open_position_for_timeframe(open_positions, strategy_name, lower_timeframe):
+            self._log_strategy_eval(
+                "🧪 Strategy decision result | status=failed symbol=%s strategy=%s pair=%s ltf=%s htf=%s reason=timeframe_position_exists",
+                symbol,
+                candidate.strategy,
+                pair_tag,
+                lower_timeframe,
+                higher_timeframe,
+            )
+            logger.info(
+                "⛔ Signal skipped (timeframe already has open position) | key=%s strategy=%s timeframe=%s",
+                signal_key,
+                candidate.strategy,
+                lower_timeframe,
+            )
+            _audit_outcome("rejected", "timeframe_position_exists")
+            return
+
         ladder_target = max(1, int(self.settings.ladder_entries if self.settings.enable_multi_entry else 1))
         current_strategy_open = int(strategy_open_positions.get(strategy_name, 0))
         available_strategy_slots = max(0, ladder_target - current_strategy_open)
@@ -635,6 +858,7 @@ class GoldLiveService:
                 ladder_target,
                 candidate.direction,
             )
+            _audit_outcome("rejected", "strategy_ladder_cap_reached")
             return
 
         execution_now = datetime.now(timezone.utc)
@@ -655,6 +879,7 @@ class GoldLiveService:
                 candidate.strategy,
                 cooldown_minutes,
             )
+            _audit_outcome("rejected", "cooldown_active")
             return
 
         ladder_entries = self.runner.trade_manager.build_ladder(
@@ -681,6 +906,7 @@ class GoldLiveService:
                 available_strategy_slots,
                 daily_trade_slots,
             )
+            _audit_outcome("rejected", "no_execution_slots")
             return
 
         if executable_slots < len(ladder_entries):
@@ -713,6 +939,7 @@ class GoldLiveService:
                 candidate.strategy,
                 candidate.direction,
             )
+            _audit_outcome("rejected", "missing_live_quote")
             return
 
         logger.info(
@@ -725,6 +952,7 @@ class GoldLiveService:
             float(entry_price),
         )
 
+        executed_any = False
         for ladder_trade in ladder_entries[:executable_slots]:
             order = self.runner.trade_manager.build_order_request(
                 candidate=candidate,
@@ -799,6 +1027,7 @@ class GoldLiveService:
                     order_result.get("filling"),
                     order_result.get("details"),
                 )
+                _audit_outcome("rejected", f"order_rejected_level_{order['level']}")
                 continue
 
             now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
@@ -823,6 +1052,8 @@ class GoldLiveService:
                 }
             )
             self._append_marker(lower_timeframe, ts, float(order_result.get("price", order["entry_price"])), order["direction"], "entry")
+            self._append_marker(lower_timeframe, ts, float(order["stop_loss"]), order["direction"], "sl")
+            self._append_marker(lower_timeframe, ts, float(order["take_profit"]), order["direction"], "tp")
             self._append_marker(
                 higher_timeframe,
                 higher_frame.iloc[-1]["datetime"],
@@ -830,8 +1061,23 @@ class GoldLiveService:
                 order["direction"],
                 "entry",
             )
+            self._append_marker(
+                higher_timeframe,
+                higher_frame.iloc[-1]["datetime"],
+                float(order["stop_loss"]),
+                order["direction"],
+                "sl",
+            )
+            self._append_marker(
+                higher_timeframe,
+                higher_frame.iloc[-1]["datetime"],
+                float(order["take_profit"]),
+                order["direction"],
+                "tp",
+            )
             self._daily_trade_count[today_key] += 1
             self._orders_filled += 1
+            executed_any = True
             self._mark_strategy_executed(strategy_name, execution_now)
             self._log_strategy_eval(
                 "🧪 Strategy decision result | status=successful symbol=%s strategy=%s pair=%s ltf=%s htf=%s reason=order_filled level=%s",
@@ -842,6 +1088,7 @@ class GoldLiveService:
                 higher_timeframe,
                 order["level"],
             )
+            _audit_outcome("executed", f"order_filled_level_{order['level']}")
             logger.info(
                 "✅ Trade executed | key=%s symbol=%s strategy=%s level=%s ticket=%s direction=%s volume=%.2f entry=%.5f sl=%.5f tp=%.5f filling=%s",
                 signal_key,
@@ -855,6 +1102,14 @@ class GoldLiveService:
                 float(order["stop_loss"]),
                 float(order["take_profit"]),
                 order_result.get("filling"),
+            )
+
+        if executed_any:
+            self._entry_direction_lock_by_pair[lock_key] = str(candidate.direction).lower()
+            logger.info(
+                "🔒 Direction lock set | lock_key=%s direction=%s",
+                lock_key,
+                str(candidate.direction).lower(),
             )
 
     def _cooldown_minutes_for_strategy(self, strategy_name: str) -> float:
@@ -972,7 +1227,6 @@ class GoldLiveService:
         positions = self._open_positions_with_recovery(symbol)
         if positions is None:
             raise RuntimeError(f"Unable to retrieve positions for {symbol}")
-        self._last_positions = positions
         logger.info("📌 Position monitor | symbol=%s open_positions=%s", symbol, len(positions))
         now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
         existing_rows = [
@@ -1024,6 +1278,7 @@ class GoldLiveService:
                     "opened_at": opened_at,
                 }
             )
+        enriched_positions: list[dict[str, Any]] = []
         position_rows = []
         for item in positions:
             ticket = str(item.get("ticket") or "")
@@ -1037,6 +1292,10 @@ class GoldLiveService:
                 existing = existing_positions_by_comment.get(comment, {}) if comment else {}
             strategy = str(existing.get("strategy") or "external")
             timeframes = str(existing.get("timeframes") or "")
+            enriched = dict(item)
+            enriched["strategy"] = strategy
+            enriched["timeframes"] = timeframes
+            enriched_positions.append(enriched)
             position_rows.append(
                 {
                     "ticket": int(item.get("ticket", 0)),
@@ -1051,6 +1310,11 @@ class GoldLiveService:
                     "profit": float(item.get("profit", 0.0)),
                 }
             )
+
+            self._last_positions = enriched_positions
+
+        self._apply_trailing_stops(positions, existing_positions_by_key)
+
         if not position_rows:
             position_rows = [{"ticket": "-", "symbol": "-", "strategy": "-", "timeframes": "-", "direction": "-", "volume": 0.0, "entry": 0.0, "sl": 0.0, "tp": 0.0, "profit": 0.0}]
         logger.info("📋 Open positions table:\n%s", self._format_table(position_rows, ["ticket", "symbol", "strategy", "timeframes", "direction", "volume", "entry", "sl", "tp", "profit"]))
@@ -1062,6 +1326,132 @@ class GoldLiveService:
             logger.exception("⚠️ Open positions lookup failed | symbol=%s", symbol)
             if not self._recover_from_monitor_failure(symbol, exc):
                 return None
+
+    def _has_open_position_for_timeframe(self, open_positions: list[dict[str, Any]], strategy_name: str, timeframe: str) -> bool:
+        tf = str(timeframe).strip().upper()
+        strategy = str(strategy_name).strip().lower()
+        prefix = f"{self.settings.trade_comment_prefix}:"
+        for item in open_positions:
+            comment = str(item.get("comment") or "")
+            if comment.startswith(prefix):
+                tail = comment[len(prefix) :]
+                parts = tail.split(":")
+                if parts:
+                    comment_strategy = parts[0].strip().lower()
+                    if comment_strategy != strategy:
+                        continue
+                    if len(parts) >= 2:
+                        pair_token = parts[1].strip()
+                        if pair_token:
+                            for token in pair_token.replace("#", "-").split("-"):
+                                normalized = token.strip().upper()
+                                if normalized == tf:
+                                    return True
+
+            timeframes_value = str(item.get("timeframes") or "").strip().upper()
+            if timeframes_value:
+                strategy_value = str(item.get("strategy") or "").strip().lower()
+                if strategy_value and strategy_value != strategy:
+                    continue
+                if tf in [part.strip().upper() for part in timeframes_value.replace("/", ",").replace("-", ",").split(",") if part.strip()]:
+                    return True
+        return False
+
+    def _apply_trailing_stops(
+        self,
+        positions: list[dict[str, Any]],
+        stored_positions_by_key: dict[str, dict[str, Any]],
+    ) -> None:
+        if not hasattr(self.connector, "current_price") or not hasattr(self.connector, "amend_position_protection"):
+            return
+        if not positions:
+            self._trailing_activated_positions.clear()
+            self._last_trailing_stop_by_position.clear()
+            return
+
+        pip_size = max(0.00001, float(getattr(self.settings, "pip_size", 0.01)))
+        rr_trigger = max(1.0, float(getattr(self.settings, "risk_reward_ratio", 2.0)))
+        still_open_keys = {f"ctrader:ticket-{int(item.get('ticket', 0))}:{str(item.get('symbol') or '')}" for item in positions}
+        self._trailing_activated_positions &= still_open_keys
+        self._last_trailing_stop_by_position = {
+            key: value for key, value in self._last_trailing_stop_by_position.items() if key in still_open_keys
+        }
+
+        for item in positions:
+            ticket = int(item.get("ticket", 0) or 0)
+            symbol = str(item.get("symbol") or "")
+            if ticket <= 0 or not symbol:
+                continue
+
+            position_key = f"ctrader:ticket-{ticket}:{symbol}"
+            direction = "buy" if int(item.get("type", 0)) == 0 else "sell"
+            entry_price = float(item.get("price_open", 0.0) or 0.0)
+            current_stop = float(item.get("sl", 0.0) or 0.0)
+            current_take = float(item.get("tp", 0.0) or 0.0)
+            if entry_price <= 0:
+                continue
+
+            current_price = self.connector.current_price(symbol, direction)
+            if current_price is None:
+                continue
+
+            favorable_move_pips = (
+                (float(current_price) - entry_price) / pip_size
+                if direction == "buy"
+                else (entry_price - float(current_price)) / pip_size
+            )
+
+            stored = stored_positions_by_key.get(position_key, {})
+            stored_sl = float(stored.get("stop_loss", 0.0) or 0.0)
+            risk_distance = abs(entry_price - stored_sl) if stored_sl > 0 else abs(entry_price - current_stop)
+            risk_pips = (risk_distance / pip_size) if risk_distance > 0 else float(getattr(self.settings, "stop_loss_pips", 0.0))
+            risk_pips = max(1.0, risk_pips)
+            trigger_pips = risk_pips * rr_trigger
+            if favorable_move_pips < trigger_pips:
+                continue
+
+            trailing_distance = risk_pips * pip_size
+            proposed_stop = (
+                float(current_price) - trailing_distance
+                if direction == "buy"
+                else float(current_price) + trailing_distance
+            )
+            proposed_stop = round(proposed_stop, 5)
+
+            if direction == "buy" and current_stop > 0 and proposed_stop <= current_stop:
+                continue
+            if direction == "sell" and current_stop > 0 and proposed_stop >= current_stop:
+                continue
+
+            previous_applied = self._last_trailing_stop_by_position.get(position_key)
+            if previous_applied is not None and abs(previous_applied - proposed_stop) < (pip_size / 2.0):
+                continue
+
+            result = self.connector.amend_position_protection(ticket=ticket, stop_loss=proposed_stop, take_profit=current_take)
+            if not result.get("ok"):
+                logger.warning(
+                    "⚠️ Trailing stop update rejected | ticket=%s symbol=%s direction=%s proposed_sl=%.5f reason=%s details=%s",
+                    ticket,
+                    symbol,
+                    direction,
+                    proposed_stop,
+                    result.get("reason"),
+                    result.get("details"),
+                )
+                continue
+
+            self._trailing_activated_positions.add(position_key)
+            self._last_trailing_stop_by_position[position_key] = proposed_stop
+            logger.info(
+                "🔒 Trailing stop updated | ticket=%s symbol=%s direction=%s rr_trigger=%.2f risk_pips=%.2f move_pips=%.2f new_sl=%.5f",
+                ticket,
+                symbol,
+                direction,
+                rr_trigger,
+                risk_pips,
+                favorable_move_pips,
+                proposed_stop,
+            )
             try:
                 return self.connector.open_positions(symbol=symbol)
             except Exception:
@@ -1213,6 +1603,12 @@ class GoldLiveService:
             context["ema_trend"] = float(ema_trend.iloc[-1])
             if len(ema_trend) > 1:
                 context["ema_trend_prev"] = float(ema_trend.iloc[-2])
+        if strategy_name == "ema_crossover":
+            ema_slow = close.ewm(span=max(1, int(self.settings.ema_slow)), adjust=False).mean()
+            context["ema_slow"] = float(ema_slow.iloc[-1])
+            if len(ema_slow) > 1:
+                context["ema_slow_prev"] = float(ema_slow.iloc[-2])
+            context["close_vs_ema_slow"] = "above" if float(close.iloc[-1]) > float(ema_slow.iloc[-1]) else "below" if float(close.iloc[-1]) < float(ema_slow.iloc[-1]) else "equal"
         if strategy_name == "price_action" and len(lower_frame) >= 2:
             prior = lower_frame.iloc[:-1]
             context["window_bars"] = 5
@@ -1225,3 +1621,65 @@ class GoldLiveService:
             context["session_low_8"] = float(prior["low"].tail(8).min())
             context["session_close"] = float(close.iloc[-1])
         return context
+
+    def _direction_lock_allows_candidate(self, lock_key: str, candidate_direction: str) -> bool:
+        key = str(lock_key).strip().lower()
+        direction = str(candidate_direction).strip().lower()
+        if not key or direction not in {"buy", "sell"}:
+            return True
+
+        locked = str(self._entry_direction_lock_by_pair.get(key, "")).strip().lower()
+        if not locked:
+            return True
+
+        if locked != direction:
+            # Opposite-direction signal observed. Release lock and let this signal proceed.
+            self._entry_direction_lock_by_pair.pop(key, None)
+            logger.info(
+                "🔓 Direction lock released by opposite signal | lock_key=%s previous=%s incoming=%s",
+                key,
+                locked,
+                direction,
+            )
+            return True
+
+        return False
+
+    def _log_decision_audit(
+        self,
+        symbol: str,
+        strategy_name: str,
+        pair_index: int,
+        lower_timeframe: str,
+        higher_timeframe: str,
+        lower_frame: pd.DataFrame,
+        higher_frame: pd.DataFrame,
+        status: str,
+        reason: str,
+    ) -> None:
+        ltf_ts = lower_frame.iloc[-1]["datetime"] if not lower_frame.empty and "datetime" in lower_frame.columns else "n/a"
+        htf_ts = higher_frame.iloc[-1]["datetime"] if not higher_frame.empty and "datetime" in higher_frame.columns else "n/a"
+        ltf_close = float(lower_frame.iloc[-1]["close"]) if not lower_frame.empty and "close" in lower_frame.columns else 0.0
+        htf_close = float(higher_frame.iloc[-1]["close"]) if not higher_frame.empty and "close" in higher_frame.columns else 0.0
+        context = self._decision_context_for_candidate(
+            strategy_name=strategy_name,
+            lower_frame=lower_frame,
+            higher_frame=higher_frame,
+            lower_timeframe=lower_timeframe,
+            higher_timeframe=higher_timeframe,
+        )
+        logger.info(
+            "🧾 Decision audit | status=%s reason=%s symbol=%s strategy=%s pair_index=%s ltf=%s ltf_ts=%s ltf_close=%.5f htf=%s htf_ts=%s htf_close=%.5f context=%s",
+            status,
+            reason,
+            symbol,
+            strategy_name,
+            int(pair_index),
+            lower_timeframe,
+            ltf_ts,
+            ltf_close,
+            higher_timeframe,
+            htf_ts,
+            htf_close,
+            context,
+        )

@@ -1,0 +1,25 @@
+services:
+  gold-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gold-bot
+    restart: unless-stopped
+    stop_grace_period: 45s
+    env_file:
+      - bot/.env
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
+      PYTHONUNBUFFERED: "1"
+    command: ["--env", "bot/.env", "--mode", "live", "--no-plot"]
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck_live.py", "--status-file", "logs/live_heartbeat.json", "--max-age-seconds", "${HEALTHCHECK_STALE_SECONDS:-120}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    volumes:
+      - ./logs:/app/logs
+      - ./backtest/results:/app/backtest/results
+      - ./position-data:/app/position-data
+      - ./bot/.env:/app/bot/.env:ro

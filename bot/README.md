@@ -13,6 +13,7 @@ The available strategies are documented in [docs/STRATEGIES.md](../docs/STRATEGI
 - `trend_following`: EMA trend + pullback breakout logic
 - `price_action`: structural rejection logic around recent highs/lows
 - `session_breakout`: breakout above/below the recent session range
+- `ema_crossover`: dual-EMA Candle1/Candle2/Candle3 state-machine confirmation logic
 
 ## Usage
 

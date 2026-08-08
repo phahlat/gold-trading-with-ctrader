@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 import pandas as pd
 
@@ -10,6 +11,7 @@ class GoldStrategyName(str, Enum):
     TREND_FOLLOWING = "trend_following"
     PRICE_ACTION = "price_action"
     SESSION_BREAKOUT = "session_breakout"
+    EMA_CROSSOVER = "ema_crossover"
 
 
 @dataclass(frozen=True)
@@ -20,9 +22,21 @@ class SignalCandidate:
     price: float
 
 
+@dataclass
+class _EmaCrossoverState:
+    phase: int = 0
+    direction: str = ""
+    candle1_close: float = 0.0
+    candle2_close: float = 0.0
+    candle1_time: str = ""
+    last_processed_time: str = ""
+    last_relation: int = 0
+
+
 class GoldStrategyEngine:
     def __init__(self, strategy_names: list[str]) -> None:
         self.strategy_names = [name.lower() for name in strategy_names]
+        self._ema_state_by_key: dict[str, _EmaCrossoverState] = {}
 
     def evaluate(
         self,
@@ -30,6 +44,7 @@ class GoldStrategyEngine:
         settings: object,
         higher_frame: pd.DataFrame | None = None,
         strategy_names: list[str] | None = None,
+        context_key: str | None = None,
     ) -> list[SignalCandidate]:
         candidates: list[SignalCandidate] = []
         if frame.empty:
@@ -44,6 +59,8 @@ class GoldStrategyEngine:
             candidates.extend(self._price_action(close, frame))
         if "session_breakout" in active_strategies:
             candidates.extend(self._session_breakout(close, frame))
+        if "ema_crossover" in active_strategies:
+            candidates.extend(self._ema_crossover(close, frame, settings, context_key=context_key))
 
         return self._apply_higher_timeframe_bias(candidates, higher_frame, settings)
 
@@ -55,6 +72,11 @@ class GoldStrategyEngine:
     ) -> list[SignalCandidate]:
         if not candidates or higher_frame is None or higher_frame.empty:
             return candidates
+
+        non_ema = [candidate for candidate in candidates if candidate.strategy != "ema_crossover"]
+        ema_candidates = [candidate for candidate in candidates if candidate.strategy == "ema_crossover"]
+        if not non_ema:
+            return ema_candidates
 
         if "close" not in higher_frame.columns:
             return candidates
@@ -83,7 +105,8 @@ class GoldStrategyEngine:
 
         if bias == "neutral":
             return candidates
-        return [candidate for candidate in candidates if candidate.direction == bias]
+        filtered = [candidate for candidate in non_ema if candidate.direction == bias]
+        return filtered + ema_candidates
 
     def _trend_following(self, close: pd.Series, frame: pd.DataFrame, settings: object) -> list[SignalCandidate]:
         fast_period = int(getattr(settings, "ema_fast", 9))
@@ -135,4 +158,125 @@ class GoldStrategyEngine:
             return [SignalCandidate(strategy="session_breakout", direction="buy", reason="breakout above session range", price=recent_close)]
         if recent_close < session_low:
             return [SignalCandidate(strategy="session_breakout", direction="sell", reason="breakout below session range", price=recent_close)]
+        return []
+
+    def _ema_crossover(
+        self,
+        close: pd.Series,
+        frame: pd.DataFrame,
+        settings: object,
+        context_key: str | None = None,
+    ) -> list[SignalCandidate]:
+        ema_slow_period = int(getattr(settings, "ema_slow", 200))
+        if len(close) < max(ema_slow_period + 2, 3):
+            return []
+
+        ema_slow = close.ewm(span=ema_slow_period, adjust=False).mean()
+
+        ts_value: Any = frame.iloc[-1]["datetime"] if "datetime" in frame.columns else len(frame) - 1
+        candle_time = pd.Timestamp(ts_value).isoformat()
+        state_key = str(context_key or "ema_crossover:default")
+        state = self._ema_state_by_key.setdefault(state_key, _EmaCrossoverState())
+        if state.last_processed_time == candle_time:
+            return []
+
+        state.last_processed_time = candle_time
+        last_close = float(close.iloc[-1])
+        last_slow = float(ema_slow.iloc[-1])
+        relation = 1 if last_close > last_slow else -1 if last_close < last_slow else 0
+        bullish_env = relation > 0
+        bearish_env = relation < 0
+        bullish_cross = state.last_relation <= 0 and relation > 0
+        bearish_cross = state.last_relation >= 0 and relation < 0
+        state.last_relation = relation
+
+        def _start_new(phase_direction: str) -> None:
+            state.phase = 1
+            state.direction = phase_direction
+            state.candle1_close = last_close
+            state.candle2_close = 0.0
+            state.candle1_time = candle_time
+
+        if state.phase == 0:
+            if bullish_cross:
+                _start_new("buy")
+            elif bearish_cross:
+                _start_new("sell")
+            return []
+
+        if state.phase == 1 and state.direction == "buy":
+            if not bullish_env:
+                state.phase = 0
+                state.direction = ""
+                if bearish_cross:
+                    _start_new("sell")
+                return []
+            if last_close >= state.candle1_close:
+                state.phase = 0
+                state.direction = ""
+                return [SignalCandidate(strategy="ema_crossover", direction="buy", reason="EMA C1/C2 bullish confirmation", price=last_close)]
+            state.phase = 2
+            state.candle2_close = last_close
+            return []
+
+        if state.phase == 1 and state.direction == "sell":
+            if not bearish_env:
+                state.phase = 0
+                state.direction = ""
+                if bullish_cross:
+                    _start_new("buy")
+                return []
+            if last_close <= state.candle1_close:
+                state.phase = 0
+                state.direction = ""
+                return [SignalCandidate(strategy="ema_crossover", direction="sell", reason="EMA C1/C2 bearish confirmation", price=last_close)]
+            state.phase = 2
+            state.candle2_close = last_close
+            return []
+
+        if state.phase == 2 and state.direction == "buy":
+            if not bullish_env:
+                state.phase = 0
+                state.direction = ""
+                if bearish_cross:
+                    _start_new("sell")
+                return []
+            if last_close > state.candle1_close and last_close > state.candle2_close:
+                state.phase = 0
+                state.direction = ""
+                return [SignalCandidate(strategy="ema_crossover", direction="buy", reason="EMA C1/C2/C3 bullish confirmation", price=last_close)]
+            if last_close == state.candle1_close:
+                state.phase = 0
+                state.direction = ""
+                return [SignalCandidate(strategy="ema_crossover", direction="buy", reason="EMA C3 equals C1 bullish confirmation", price=last_close)]
+            if last_close < state.candle1_close:
+                state.phase = 0
+                state.direction = ""
+                if bullish_cross:
+                    _start_new("buy")
+                elif bearish_cross:
+                    _start_new("sell")
+            return []
+
+        if state.phase == 2 and state.direction == "sell":
+            if not bearish_env:
+                state.phase = 0
+                state.direction = ""
+                if bullish_cross:
+                    _start_new("buy")
+                return []
+            if (last_close < state.candle1_close and last_close < state.candle2_close) or last_close == state.candle1_close:
+                state.phase = 0
+                state.direction = ""
+                return [SignalCandidate(strategy="ema_crossover", direction="sell", reason="EMA C1/C2/C3 bearish confirmation", price=last_close)]
+            state.phase = 0
+            state.direction = ""
+            if bearish_cross:
+                _start_new("sell")
+            elif bullish_cross:
+                _start_new("buy")
+            return []
+
+        state.phase = 0
+        state.direction = ""
         return []
