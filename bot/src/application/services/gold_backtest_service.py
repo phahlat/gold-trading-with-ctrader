@@ -11,7 +11,6 @@ import pandas as pd
 from bot.src.application.services.gold_runner import GoldRunner
 from bot.src.infrastructure.charting.live_plot import LiveChartRenderer
 from bot.src.infrastructure.config.settings import GoldSettings
-from bot.src.infrastructure.ctrader.connector import GoldCTraderConnector
 from bot.src.infrastructure.persistence.sqlite_store import GoldPositionStore
 
 logger = logging.getLogger(__name__)

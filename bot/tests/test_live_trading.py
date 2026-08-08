@@ -693,3 +693,52 @@ def test_trailing_stop_updates_after_reaching_rr_trigger(tmp_path: Path) -> None
     assert len(amendments) == 1
     assert amendments[0]["ticket"] == 7
     assert float(amendments[0]["stop_loss"]) == 101.2
+
+
+def test_closed_candle_frame_drops_single_unclosed_bar(tmp_path: Path) -> None:
+    settings = SimpleNamespace(
+        strategy_names=["trend_following"],
+        healthcheck_status_file=str(tmp_path / "live_heartbeat.json"),
+    )
+    runner = GoldRunner(settings)
+
+    class DummyConnector:
+        pass
+
+    service = GoldLiveService(
+        settings=settings,
+        runner=runner,
+        connector=DummyConnector(),
+        position_store=GoldPositionStore(tmp_path / "positions.sqlite3"),
+        chart_renderer=LiveChartRenderer(
+            output_dir=tmp_path,
+            interactive=False,
+            chart_width=14.0,
+            chart_height=8.0,
+            max_lower_candles=120,
+            max_higher_candles=90,
+        ),
+    )
+
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    unclosed = pd.DataFrame(
+        {
+            "datetime": [now - pd.Timedelta(minutes=1)],
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+        }
+    )
+    closed = pd.DataFrame(
+        {
+            "datetime": [now - pd.Timedelta(minutes=10)],
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+        }
+    )
+
+    assert service._closed_candle_frame(unclosed, "M5").empty
+    assert len(service._closed_candle_frame(closed, "M5")) == 1

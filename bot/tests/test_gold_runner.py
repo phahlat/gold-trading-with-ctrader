@@ -62,6 +62,38 @@ def test_price_action_breakout_uses_prior_window() -> None:
     assert any(item.strategy == "price_action" and item.direction == "buy" for item in candidates)
 
 
+def test_price_action_ignores_wick_only_breakout() -> None:
+    frame = pd.DataFrame(
+        {
+            "open": [100.0, 100.2, 100.4, 100.6, 100.8, 101.0],
+            "high": [101.0, 101.2, 101.4, 101.6, 101.8, 105.0],
+            "low": [99.8, 100.0, 100.2, 100.4, 100.6, 100.7],
+            "close": [100.5, 100.7, 100.9, 101.1, 101.3, 101.3],
+        }
+    )
+    engine = GoldStrategyEngine(["price_action"])
+
+    candidates = engine.evaluate(frame, settings=SimpleNamespace())
+
+    assert candidates == []
+
+
+def test_session_breakout_ignores_wick_only_breakout() -> None:
+    frame = pd.DataFrame(
+        {
+            "open": [100.0, 100.2, 100.4, 100.6, 100.8, 101.0, 101.2, 101.4, 101.6],
+            "high": [101.0, 101.2, 101.4, 101.6, 101.8, 102.0, 102.2, 102.4, 106.0],
+            "low": [99.8, 100.0, 100.2, 100.4, 100.6, 100.8, 101.0, 101.2, 101.4],
+            "close": [100.5, 100.7, 100.9, 101.1, 101.3, 101.5, 101.7, 101.9, 101.9],
+        }
+    )
+    engine = GoldStrategyEngine(["session_breakout"])
+
+    candidates = engine.evaluate(frame, settings=SimpleNamespace())
+
+    assert candidates == []
+
+
 def test_ema_crossover_state_machine_bullish_three_candle_confirmation() -> None:
     engine = GoldStrategyEngine(["ema_crossover"])
     settings = SimpleNamespace(ema_fast=2, ema_slow=3)

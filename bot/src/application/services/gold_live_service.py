@@ -484,8 +484,6 @@ class GoldLiveService:
     def _closed_candle_frame(self, frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         if frame.empty or "datetime" not in frame.columns:
             return frame
-        if len(frame) < 2:
-            return frame
 
         timeframe_delta = self._timeframe_delta(timeframe)
         if timeframe_delta is None:
@@ -1610,15 +1608,15 @@ class GoldLiveService:
                 context["ema_slow_prev"] = float(ema_slow.iloc[-2])
             context["close_vs_ema_slow"] = "above" if float(close.iloc[-1]) > float(ema_slow.iloc[-1]) else "below" if float(close.iloc[-1]) < float(ema_slow.iloc[-1]) else "equal"
         if strategy_name == "price_action" and len(lower_frame) >= 2:
-            prior = lower_frame.iloc[:-1]
+            prior_close = close.iloc[:-1]
             context["window_bars"] = 5
-            context["recent_high_5"] = float(prior["high"].tail(5).max())
-            context["recent_low_5"] = float(prior["low"].tail(5).min())
+            context["recent_close_high_5"] = float(prior_close.tail(5).max())
+            context["recent_close_low_5"] = float(prior_close.tail(5).min())
         if strategy_name == "session_breakout" and len(lower_frame) >= 8:
-            prior = lower_frame.iloc[:-1]
+            prior_close = close.iloc[:-1]
             context["window_bars"] = 8
-            context["session_high_8"] = float(prior["high"].tail(8).max())
-            context["session_low_8"] = float(prior["low"].tail(8).min())
+            context["session_close_high_8"] = float(prior_close.tail(8).max())
+            context["session_close_low_8"] = float(prior_close.tail(8).min())
             context["session_close"] = float(close.iloc[-1])
         return context
 

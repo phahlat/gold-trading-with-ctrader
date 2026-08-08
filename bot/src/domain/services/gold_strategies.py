@@ -134,30 +134,30 @@ class GoldStrategyEngine:
         if len(close) < 2:
             return []
         current = float(close.iloc[-1])
-        prior_window = frame.iloc[:-1]
-        if prior_window.empty:
+        prior_close = close.iloc[:-1]
+        if prior_close.empty:
             return []
-        recent_high = float(prior_window["high"].tail(5).max())
-        recent_low = float(prior_window["low"].tail(5).min())
-        if current > recent_high:
-            return [SignalCandidate(strategy="price_action", direction="buy", reason="rejection at resistance", price=current)]
-        if current < recent_low:
-            return [SignalCandidate(strategy="price_action", direction="sell", reason="rejection at support", price=current)]
+        recent_close_high = float(prior_close.tail(5).max())
+        recent_close_low = float(prior_close.tail(5).min())
+        if current > recent_close_high:
+            return [SignalCandidate(strategy="price_action", direction="buy", reason="close breakout above recent close range", price=current)]
+        if current < recent_close_low:
+            return [SignalCandidate(strategy="price_action", direction="sell", reason="close breakout below recent close range", price=current)]
         return []
 
     def _session_breakout(self, close: pd.Series, frame: pd.DataFrame) -> list[SignalCandidate]:
         if len(close) < 8:
             return []
-        prior_window = frame.iloc[:-1]
-        if prior_window.empty:
+        prior_close = close.iloc[:-1]
+        if prior_close.empty:
             return []
-        session_high = float(prior_window["high"].tail(8).max())
-        session_low = float(prior_window["low"].tail(8).min())
+        session_close_high = float(prior_close.tail(8).max())
+        session_close_low = float(prior_close.tail(8).min())
         recent_close = float(close.iloc[-1])
-        if recent_close > session_high:
-            return [SignalCandidate(strategy="session_breakout", direction="buy", reason="breakout above session range", price=recent_close)]
-        if recent_close < session_low:
-            return [SignalCandidate(strategy="session_breakout", direction="sell", reason="breakout below session range", price=recent_close)]
+        if recent_close > session_close_high:
+            return [SignalCandidate(strategy="session_breakout", direction="buy", reason="close breakout above session close range", price=recent_close)]
+        if recent_close < session_close_low:
+            return [SignalCandidate(strategy="session_breakout", direction="sell", reason="close breakout below session close range", price=recent_close)]
         return []
 
     def _ema_crossover(
